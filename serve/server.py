@@ -986,13 +986,13 @@ class Service:
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb = getattr(self.embeddings, "path", None)
-        # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
-        # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
-        engine_last0 = getattr(self.engine, "last", None)
         with self.status_lock:
             self.status["queued"] += 1
-        try:
-            with self.fifo:
+        # #266: status and metrics belong to the same critical section as engine generation.
+        with self.fifo:
+            # Capture after waiting: an earlier request may have replaced engine.last while we queued.
+            engine_last0 = getattr(self.engine, "last", None)
+            try:
                 with self.status_lock:
                     self.status["queued"] -= 1
                 # issue #27: it died in an earlier request (or was unloaded) - start it again instead of failing
@@ -1040,54 +1040,54 @@ class Service:
                     gen.close()                         # STOP+drain to THIS request's DONE while still holding the
                     #                                     fifo, so a stop-token break can't leave the shared engine
                     #                                     queue mid-drain for the next request to read as its own DONE
-        except GeneratorExit:                           # the client disconnected mid-stream
-            finish = "disconnect"
-            raise
-        finally:
-            if emb:
-                Path(emb).unlink(missing_ok=True)
-            with self.status_lock:
-                if self.status.get("busy"):
-                    # only this request's DONE counts: same object means no DONE arrived (death, error, disconnect)
-                    last = dict(getattr(self.engine, "last", {}) or {}) \
-                        if getattr(self.engine, "last", None) is not engine_last0 else {}
-                    started = self.status.get("started", time.time())
-                    loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
-                    hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
-                    self.history.append({
-                        "projection": (sampling or {}).get("experimental_speed_projection") is not False
-                        if loaded else None,
-                        "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
-                        "prompt_tokens": len(ids), "reused": last.get("reused"), "output_tokens": n,
-                        "engine_generated": last.get("generated"),
-                        "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
-                        "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
-                        if n and last.get("generated") and last.get("decode_ms") else None,
-                        "hit_rate": hit_rate})
-                    t = self.totals
-                    t["requests"] += 1
-                    t["prompt_tokens"] += len(ids)
-                    t["reused"] += last.get("reused") or 0
-                    t["output_tokens"] += n
-                    t["prompt_ms"] += last.get("prompt_ms") or 0.0
-                    t["decode_ms"] += last.get("decode_ms") or 0.0
-                    fresh = getattr(self.engine, "last", None)
-                    if fresh is not None and fresh is not before:      # the engine's clock for THIS request
-                        timings = request_timings(len(ids), n, last)
-                        self.last_timings = dict(timings, at=int(time.time())) if timings else None
-                    self.last_request_at = time.time()
-                    now = time.time()
-                    el = now - self.status.get("started", now)
-                    ft = self.status.get("first_token")
-                    rate = n / max(1e-6, now - ft) if ft else 0.0
-                    hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
-                    print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
-                          f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
-                    if os.environ.get("STRATA_DEBUG") and raw_ids:
-                        print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
-                self.status["busy"] = False
-                self.status.pop("tail", None)            # #212: the answer's end is not kept once it is done
-                self.status.pop("tool", None)
+            except GeneratorExit:                           # the client disconnected mid-stream
+                finish = "disconnect"
+                raise
+            finally:
+                if emb:
+                    Path(emb).unlink(missing_ok=True)
+                with self.status_lock:
+                    if self.status.get("busy"):
+                        # only this request's DONE counts: same object means no DONE arrived (death, error, disconnect)
+                        last = dict(getattr(self.engine, "last", {}) or {}) \
+                            if getattr(self.engine, "last", None) is not engine_last0 else {}
+                        started = self.status.get("started", time.time())
+                        loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
+                        hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
+                        self.history.append({
+                            "projection": (sampling or {}).get("experimental_speed_projection") is not False
+                            if loaded else None,
+                            "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
+                            "prompt_tokens": len(ids), "reused": last.get("reused"), "output_tokens": n,
+                            "engine_generated": last.get("generated"),
+                            "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
+                            "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
+                            if n and last.get("generated") and last.get("decode_ms") else None,
+                            "hit_rate": hit_rate})
+                        t = self.totals
+                        t["requests"] += 1
+                        t["prompt_tokens"] += len(ids)
+                        t["reused"] += last.get("reused") or 0
+                        t["output_tokens"] += n
+                        t["prompt_ms"] += last.get("prompt_ms") or 0.0
+                        t["decode_ms"] += last.get("decode_ms") or 0.0
+                        fresh = getattr(self.engine, "last", None)
+                        if fresh is not None and fresh is not before:      # the engine's clock for THIS request
+                            timings = request_timings(len(ids), n, last)
+                            self.last_timings = dict(timings, at=int(time.time())) if timings else None
+                        self.last_request_at = time.time()
+                        now = time.time()
+                        el = now - self.status.get("started", now)
+                        ft = self.status.get("first_token")
+                        rate = n / max(1e-6, now - ft) if ft else 0.0
+                        hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
+                        print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
+                              f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
+                        if os.environ.get("STRATA_DEBUG") and raw_ids:
+                            print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
+                    self.status["busy"] = False
+                    self.status.pop("tail", None)            # #212: the answer's end is not kept once it is done
+                    self.status.pop("tool", None)
         for ev in parser.finish():
             yield "event", ev
         yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),

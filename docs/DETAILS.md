@@ -458,6 +458,9 @@ sizes and K/V bytes reused during capture. `STRATA_SNAPSHOT_FULL_CAPTURE=1` disa
 retention for diagnostic comparisons. Snapshots are not
 persisted across restarts.
 
+Requests are serialized through engine draining and status/metrics finalization, including cancellation and
+disconnects. A completed request cannot clear the following request's status (fork fix for #266).
+
 **Current limits (v1):** one request at a time, and one conversation cached at a time (switching between two chats
 re-reads the other one unless the opt-in cache above is enabled); images only when set up with them (below); no video. **Temperature / top_p / top_k / min_p /
 seed** are honored per request (OpenAI and Anthropic fields); with the default adaptive expert tier a sampled result

@@ -1070,5 +1070,92 @@ class SharingTheGpu(unittest.TestCase):
         self.assertEqual((self.svc.idle_unload_s, self.svc.min_free_vram_mib, self.svc.before_load), (0, 0, None))
         self.assertEqual(self.req("/health")[1]["loaded"], True)
 
+class RequestFinalization(unittest.TestCase):
+    """#266: the next request can acquire FIFO as soon as the previous one releases it."""
+
+    def test_handoff_preserves_status_and_metrics(self):
+        for ending in ("complete", "cancel", "disconnect", "error"):
+            with self.subTest(ending=ending):
+                tok = ByteTokenizer()
+
+                class HandoffEngine(ClockedEngine):
+                    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                        if ending == "error" and ids == [1]:
+                            yield tok.encode("a")[0]
+                            raise EngineDied("test failure")
+                        yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+                engine = HandoffEngine(tok, "abcdefghij", max_context=CTX)
+                svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+                second = svc.run([2, 3], False, None, 10, {}, threading.Event())
+                cancel = threading.Event()
+                first = svc.run([1], False, None, 10, {}, cancel)
+                released = []
+
+                class HandoffLock:
+                    """Force the scheduling gap without threads, sleeps or timing dependence."""
+                    def __init__(self):
+                        self.lock = threading.Lock()
+                        self.once = True
+
+                    def __enter__(self):
+                        self.lock.acquire()
+
+                    def __exit__(self, *args):
+                        self.lock.release()
+                        if self.once:
+                            self.once = False
+                            released.append((len(svc.history), svc.status.get("busy")))
+                            next(second)
+
+                svc.fifo = HandoffLock()
+                try:
+                    next(first)
+                    if ending == "disconnect":
+                        first.close()
+                    elif ending == "error":
+                        with self.assertRaises(EngineDied):
+                            list(first)
+                    else:
+                        if ending == "cancel":
+                            cancel.set()
+                        list(first)
+                    self.assertEqual(released, [(1, False)])
+                    self.assertTrue(svc.status["busy"])
+                    self.assertIn("tail", svc.status)
+                    list(second)
+                    self.assertFalse(svc.status["busy"])
+                    self.assertNotIn("tail", svc.status)
+                    self.assertEqual(svc.totals["requests"], 2)
+                    self.assertEqual(svc.totals["prompt_tokens"], 3)
+                    self.assertEqual([h["prompt_tokens"] for h in svc.history], [1, 2])
+                    self.assertEqual(svc.history[0]["finish"], "length" if ending == "complete" else ending)
+                    self.assertEqual(svc.history[1]["engine_generated"], 10)
+                    if ending == "error":
+                        self.assertIsNone(svc.history[0]["engine_generated"])
+                finally:
+                    first.close()
+                    second.close()
+
+    def test_waiting_request_does_not_claim_previous_engine_timings(self):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, "abc", max_context=CTX)
+        engine.last = {"generated": 4, "decode_ms": 40}
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+
+        class QueueLock:
+            def __enter__(self):
+                # The previous request finishes while this request waits to acquire FIFO.
+                engine.last = {"generated": 8, "decode_ms": 80}
+
+            def __exit__(self, *args):
+                pass
+
+        svc.fifo = QueueLock()
+        list(svc.run([1], False, None, 2, {}, threading.Event()))
+        self.assertIsNone(svc.history[0]["engine_generated"])
+        self.assertEqual(svc.totals["decode_ms"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
