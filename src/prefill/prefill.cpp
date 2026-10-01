@@ -1,5 +1,6 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/prefill/prefill.hpp"
+#include "strata/core/on_device.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/on_device.hpp"
@@ -110,17 +111,27 @@ struct Alloc {
     uint64_t cap = 0, used = 0;
     bool count_only = false;
     std::vector<void*>* owned = nullptr;
+    InitResult failure = InitResult::error;
+    cudaError_t cuda_failure = cudaSuccess;
     template <typename T> T* take(size_t n, bool& ok) {
         const uint64_t bytes = ((uint64_t) n * sizeof(T) + 256 + 255) & ~255ull;
         if (count_only) { used += bytes; return nullptr; }
+        if (!ok) return nullptr;
         if (base != nullptr) {
-            if (used + bytes > cap) { ok = false; return nullptr; }
+            if (used + bytes > cap) { failure = InitResult::out_of_memory; ok = false; return nullptr; }
             T* p = (T*) (base + used);
             used += bytes;
             return p;
         }
         void* p = nullptr;
-        if (cudaMalloc(&p, bytes) != cudaSuccess) { ok = false; return nullptr; }
+        const cudaError_t status = cudaMalloc(&p, bytes);
+        if (status != cudaSuccess) {
+            cuda_failure = status;
+            failure = status == cudaErrorMemoryAllocation ? InitResult::out_of_memory : InitResult::error;
+            (void) cudaGetLastError();
+            ok = false;
+            return nullptr;
+        }
         owned->push_back(p);
         used += bytes;
         return (T*) p;
@@ -157,7 +168,7 @@ struct Stager {
     std::vector<std::thread> threads;
     int device = 0;
 
-    bool init(size_t blob_bytes, int nthreads) {
+    bool init(size_t blob_bytes, int nthreads, cudaError_t& failure) {
         if (const char* v = std::getenv("STRATA_STAGER_RING")) kRing = std::clamp(std::atoi(v), 2, 256);
         buf.assign((size_t) kRing, nullptr);
         pinned.assign((size_t) kRing, 0);
@@ -170,7 +181,8 @@ struct Stager {
                 pageable[(size_t) i].resize(blob_bytes);
                 buf[i] = pageable[(size_t) i].data();
             }
-            if (cudaEventCreateWithFlags(&dma_done[i], cudaEventDisableTiming) != cudaSuccess) return false;
+            failure = cudaEventCreateWithFlags(&dma_done[i], cudaEventDisableTiming);
+            if (failure != cudaSuccess) return false;
         }
         cudaGetDevice(&device);
         for (int t = 0; t < nthreads; ++t) threads.emplace_back([this] { work(); });
@@ -361,6 +373,10 @@ void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::k
         st.k_pool = o.take<uint16_t>(rows * s.head_dim, ok);
         st.v_pool = o.take<uint16_t>(rows * s.head_dim, ok);
     }
+    if (!ok && stage_own()) {
+        o_borrowed.failure = own.failure;
+        o_borrowed.cuda_failure = own.cuda_failure;
+    }
 }
 strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, const int32_t* table) {
     strata::kernels::QsaAttnPools p;
@@ -372,8 +388,19 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
 }  // namespace
 
 Prefill::Prefill() : impl_(new Impl) {}
-Prefill::~Prefill() {
+Prefill::~Prefill() { release(); }
+
+void Prefill::reset() {
+    release();
+    impl_ = std::make_unique<Impl>();
+    stats_ = {};
+    hand_in_ = nullptr;
+    init_result_ = InitResult::error;
+}
+
+void Prefill::release() {
     if (!impl_) return;
+    const core::OnDevice on(impl_->device);
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
     for (int i = 0; i < RING_MAX; ++i) {
@@ -388,6 +415,8 @@ Prefill::~Prefill() {
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
     for (void* p : impl_->owned) cudaFree(p);
+    // Destroy the stager and cuBLAS handle before restoring the caller's CUDA device.
+    impl_.reset();
 }
 
 namespace {
@@ -471,47 +500,52 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
                    void* stream, std::string& err, void* borrow, uint64_t borrow_bytes) {
+    reset();
+    err.clear();
+    auto checked = [&](cudaError_t status, const char* operation) {
+        if (status == cudaSuccess) return true;
+        init_result_ = status == cudaErrorMemoryAllocation ? InitResult::out_of_memory : InitResult::error;
+        err = std::string("prefill: ") + operation + ": " + cudaGetErrorString(status);
+        (void) cudaGetLastError();
+        return false;
+    };
     Impl& m = *impl_;
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
     m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
     if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
         err = "prefill: geometry differs from the artifact's"; return false;
     }
-    cudaGetDevice(&m.device);
+    if (!checked(cudaGetDevice(&m.device), "get device")) return false;
     if (stage_le_ < 0) stage_le_ = g.n_layers;
     if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers || (stage_le_ < g.n_layers) != (next_ != nullptr)) {
         err = "prefill: the stage's layer range is wrong";
         return false;
     }
     for (int b = 0; next_ != nullptr && b < 2; ++b)
-        if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
-            err = "prefill: the layer split's hand-off buffers";
-            return false;
-        }
-    if (m.tok_dev == nullptr) {
-        if (cudaMalloc((void**) &m.tok_dev, (size_t) chunk * sizeof(int32_t)) != cudaSuccess) {
-            err = "prefill: the token id buffer";
-            return false;
-        }
-        m.owned.push_back(m.tok_dev);
-        m.tok_host.resize((size_t) chunk);
-    }
-    if (cudaStreamCreateWithFlags(&m.copy, cudaStreamNonBlocking) != cudaSuccess) { err = "prefill: copy stream"; return false; }
+        if (!checked(cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable),
+                     "layer split hand-off buffers")) return false;
+    if (!checked(cudaMalloc((void**) &m.tok_dev, (size_t) chunk * sizeof(int32_t)), "token id buffer")) return false;
+    m.owned.push_back(m.tok_dev);
+    m.tok_host.resize((size_t) chunk);
+    if (!checked(cudaStreamCreateWithFlags(&m.copy, cudaStreamNonBlocking), "copy stream")) return false;
     const size_t T = (size_t) chunk;
     m.T_max = chunk;
     m.borrowed = borrow != nullptr;
     bool ok = true;
     // one-time: events, the stager, the host buffers (for the largest chunk), the identity page table
     for (int i = 0; i < RING_MAX; ++i) {
-        if (cudaEventCreateWithFlags(&m.copied[i], cudaEventDisableTiming) != cudaSuccess) ok = false;
-        if (cudaEventCreateWithFlags(&m.used[i], cudaEventDisableTiming) != cudaSuccess) ok = false;
+        if (!checked(cudaEventCreateWithFlags(&m.copied[i], cudaEventDisableTiming), "copy event") ||
+            !checked(cudaEventCreateWithFlags(&m.used[i], cudaEventDisableTiming), "use event")) return false;
     }
     if (!m.stager) {
         m.stager = std::make_unique<Stager>();
         const int hw = (int) std::thread::hardware_concurrency();
         const char* stv = std::getenv("STRATA_STAGER_THREADS");   // D-5: the host copy threads of unpinned blobs
-        if (!m.stager->init((size_t) MAXBLOB(), stv ? std::clamp(std::atoi(stv), 1, 32) : std::max(2, std::min(4, hw / 4))))
-            ok = false;
+        cudaError_t failure = cudaSuccess;
+        if (!m.stager->init((size_t) MAXBLOB(), stv ? std::clamp(std::atoi(stv), 1, 32) : std::max(2, std::min(4, hw / 4)), failure)) {
+            checked(failure, "stager event");
+            return false;
+        }
     }
     m.steps_host.resize(T * strata::kernels::kStepCount);
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
@@ -542,21 +576,18 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             m.ple_pageable[b].resize(T * N);          // pageable: the upload is staged before it returns
             m.ple_emb_host[b] = m.ple_pageable[b].data();
         }
-        if (!m.ple_copied[b] && cudaEventCreateWithFlags(&m.ple_copied[b], cudaEventDisableTiming) != cudaSuccess)
-            ok = false;
+        if (!checked(cudaEventCreateWithFlags(&m.ple_copied[b], cudaEventDisableTiming), "PLE event")) return false;
         m.ple_rows[b].resize(T * strata::kernels::PLE_N_HEADS);
     }
     if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {   // KV streaming: the staging pool's identity page table
         const int64_t pages = ss.qsa_states[ss.qsa_primary()].n_pages;
         std::vector<int32_t> ident((size_t) pages);
         for (int64_t i = 0; i < pages; ++i) ident[(size_t) i] = (int32_t) i;
-        if (cudaMalloc((void**) &m.ident_table, ident.size() * 4) != cudaSuccess ||
-            cudaMemcpy(m.ident_table, ident.data(), ident.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess)
-            ok = false;
-        else
-            m.owned.push_back(m.ident_table);
+        if (!checked(cudaMalloc((void**) &m.ident_table, ident.size() * 4), "identity table")) return false;
+        m.owned.push_back(m.ident_table);
+        if (!checked(cudaMemcpy(m.ident_table, ident.data(), ident.size() * 4, cudaMemcpyHostToDevice),
+                     "identity table upload")) return false;
     }
-    if (!ok) { err = "prefill: host buffers or events for a chunk of " + std::to_string(chunk) + " tokens"; return false; }
     Alloc o;
     o.base = (uint8_t*) borrow;
     o.cap = borrow_bytes;
@@ -564,13 +595,25 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     {
         uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
         void* ws = o.take<uint8_t>(GEMM_WS, ok);
-        if (!ok) { err = "prefill: GEMM scratch does not fit"; return false; }
-        if (!m.gemm.init_external(stream, gs, GEMM_SCRATCH, ws, GEMM_WS, err)) return false;
+        if (!ok) {
+            init_result_ = o.failure;
+            err = std::string("prefill: GEMM scratch allocation failed: ") +
+                  (o.cuda_failure == cudaSuccess ? "borrowed buffers too small" : cudaGetErrorString(o.cuda_failure));
+            return false;
+        }
+        bool oom = false;
+        if (!m.gemm.init_external(stream, gs, GEMM_SCRATCH, ws, GEMM_WS, err, &oom)) {
+            init_result_ = oom ? InitResult::out_of_memory : InitResult::error;
+            return false;
+        }
     }
     if (!carve(T, &o)) {
-        err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";
+        init_result_ = o.failure;
+        err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens: " +
+              (o.cuda_failure == cudaSuccess ? "buffers do not fit" : cudaGetErrorString(o.cuda_failure));
         return false;
     }
+    init_result_ = InitResult::ready;
     return true;
 }
 

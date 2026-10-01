@@ -95,12 +95,31 @@ into the card that owns the layer.
 - The prompt path has its own buffers on every card (1.5 GB each at the default 2048-token chunk; `--prefill 1024`
   halves that) instead of borrowing cache slots as one card does. An explicit `--expert-cache` on the first card is
   capped to leave room for them.
-- On Windows only 8 GiB of the expert arena is pinned (more, mapped into two GPU contexts, leaves WDDM refusing
-  allocations); the PCIe share covers those layers.
+- On Windows/WSL, multi-GPU registration defaults to an 8 GiB cap because mapping more pages into multiple WDDM
+  contexts can prevent later allocations. Native Linux attempts to register the whole arena; if CUDA refuses,
+  the existing per-layer fallback pins as much as it can. The startup log reports the policy and actual coverage.
+- `STRATA_ARENA_PIN_GIB=N` overrides the registration limit (integer GiB; `0` means the whole arena, including on
+  Windows/WSL). Unset it for the platform default. Invalid or overflowing values are rejected before model loading.
+- Full registration can consume additional driver/device memory. With `--prefill auto`, an allocation failure
+  releases every stage's partial prompt buffers and retries all stages with half the chunk, down to 256 tokens.
+  An explicit chunk is preserved; if it fails, choose a smaller `--prefill` or free GPU memory. Other CUDA errors
+  are reported without retrying.
+- Linux `memlock` governs the `mlock` fallback that keeps unregistered pages resident. Check `ulimit -l` when the
+  log reports `mlock failed`; raising it does not remove a Strata registration cap and is not a substitute for
+  CUDA registration. Set an appropriate limit for the model and available RAM through your system configuration.
+  Strata does not change OS limits. Performance still needs a workload-specific benchmark.
 - Every card needs compute capability 7.5 (RTX 20 or newer). The pre-sm_80 QSA scorer path is fp32 FMAs, so a
   Turing card runs the same kernels instead of the tensor-core prompt attention.
 
 ## Measured
+
+The fork's #253 regression checks need no model files. On Linux with CUDA, build with
+`-DSTRATA_BUILD_STARTUP_TESTS=ON -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86` (86 for RTX 3090), then
+build targets `arena_policy_test`, `prefill_startup_test` and `prefill_resources_test`. Run
+`ctest --test-dir <build-dir> -R '^(arena_policy_test|prefill_startup_test|prefill_resources_test)$' --output-on-failure`.
+The first two tests use simulated platforms/allocators; the last uses small synthetic buffers on each visible
+GPU to check cleanup and registration fallback. It skips when no CUDA device is available. These checks do not
+measure inference throughput.
 
 The Coder on an RTX 5080 + RTX 3090 (Ryzen 9 9950X3D), 32K context; details in
 `bench/results/2026-09-29-layer-split/`:

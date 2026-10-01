@@ -283,9 +283,15 @@ Gemm::~Gemm() {
 }
 
 bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes,
-                         std::string& err) {
+                         std::string& err, bool* out_of_memory) {
+    if (out_of_memory) *out_of_memory = false;
     cublasHandle_t h = nullptr;
-    if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) { err = "prefill gemm: cublasCreate failed"; return false; }
+    const cublasStatus_t status = cublasCreate(&h);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        if (out_of_memory) *out_of_memory = status == CUBLAS_STATUS_ALLOC_FAILED;
+        err = "prefill gemm: cublasCreate failed (status " + std::to_string((int) status) + ")";
+        return false;
+    }
     handle_ = h;
     stream_ = stream;
     external_ = true;

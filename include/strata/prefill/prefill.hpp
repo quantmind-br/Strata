@@ -15,6 +15,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
+#include "strata/prefill/startup.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -51,6 +52,10 @@ public:
     ~Prefill();
     Prefill(const Prefill&) = delete;
     Prefill& operator=(const Prefill&) = delete;
+
+    /// Release a complete or partially initialized prompt path on its owning device. Stage wiring survives.
+    void reset();
+    InitResult init_result() const { return init_result_; }
 
     /// `host_res`: the static residency table (n_layers x n_expert, slot or -1) or null; `cache` its slots.
     /// `borrow`/`borrow_bytes`: device memory to carve every buffer from (the top slots of the expert cache,
@@ -106,6 +111,8 @@ public:
     }
 
 private:
+    void release();
+    InitResult init_result_ = InitResult::error;
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)

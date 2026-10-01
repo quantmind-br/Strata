@@ -46,6 +46,7 @@
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/platform/arena_policy.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
@@ -63,6 +64,7 @@
 #include <io.h>
 #else
 #include <unistd.h>
+#include <sys/utsname.h>
 #include <cerrno>
 #endif
 
@@ -1243,6 +1245,22 @@ int main(int argc, char** argv) {
         }
     }
     const bool multi_gpu = !split_devs.empty() && !split_same;
+#if defined(_WIN32)
+    const bool wddm = true;
+#else
+    struct utsname kernel{};
+    const bool wddm = uname(&kernel) == 0 && strata::platform::is_wsl_release(kernel.release);
+#endif
+    uint64_t arena_pin_bytes = 0;
+    std::string pin_error;
+    const char* pin_override = std::getenv("STRATA_ARENA_PIN_GIB");
+    if (!strata::platform::arena_pin_limit(wddm, o.expert_cache_remote[0] > 0 || multi_gpu,
+                                          pin_override, arena_pin_bytes, pin_error)) {
+        std::fprintf(stderr, "strata generate: %s\n", pin_error.c_str());
+        return 2;
+    }
+    const bool automatic_prefill = o.prefill_auto;  // retain intent when startup caps the initial chunk
+
     if (o.mmap_experts && !o.shared_expert_arena.empty()) {
         std::fprintf(stderr, "strata generate: --shared-expert-arena backs the resident arena and cannot be used with --mmap-experts\n");
         return 2;
@@ -2274,12 +2292,11 @@ int main(int argc, char** argv) {
         srcp = &src;
     } else {
         arena_src.set_gguf(o.native_preset);   // plan v0.3 P6: a native pack may take its experts from shard 1
-        // On the multi-GPU Windows experiment, start with at most 8 GiB of mapped host pages.
-        // Unregistered layers remain in the resident arena and use the CPU expert path.
-        // (a layer split across GPUs too: pinning all of it into two contexts leaves WDDM refusing every later
-        // allocation - measured on the 5080 + 3090 rig: cudaMemGetInfo and the next cudaMalloc fail)
-        const uint64_t pin_limit = (o.expert_cache_remote[0] > 0 || multi_gpu) ? (8ull << 30) : 0;
-        if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
+        const std::string pin_policy = arena_pin_bytes ? std::to_string(arena_pin_bytes >> 30) + " GiB cap"
+                                                       : "whole arena";
+        std::fprintf(stderr, "strata generate: arena pin policy: %s (%s, %s)\n", pin_policy.c_str(),
+                     pin_override ? "STRATA_ARENA_PIN_GIB" : "automatic", wddm ? "Windows/WSL" : "native Linux");
+        if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, arena_pin_bytes,
                             o.shared_expert_arena)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
@@ -3509,8 +3526,7 @@ int main(int argc, char** argv) {
                 for (const int64_t c : kAutoChunks)
                     if (fits(c, true)) { chunk = c; break; }
             } else {
-                for (int64_t c = o.prefill_chunk; c >= 256; c /= 2)
-                    if (fits(c, false)) { chunk = c; break; }
+                if (fits(o.prefill_chunk, false)) chunk = o.prefill_chunk;
             }
             if (chunk > 0) {
                 if (o.prefill_auto)
@@ -3555,31 +3571,46 @@ int main(int argc, char** argv) {
         } else {
             std::fprintf(stderr, "strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)\n");
         }
-        // layer split across GPUs: a prompt path per stage, each handing its chunk's rows to the next
+        // #253: full Linux arena registration can leave less device memory for prompt buffers.
+        // Initialize all stages at the same chunk and unwind all partial allocations before a retry.
         for (size_t i = 0; i < stages.size(); ++i) {
             GpuStage& st = *stages[i];
-            st.sp.set_stage(st.lb, i + 1 < stages.size() ? st.le : -1, i + 1 < stages.size() ? &stages[i + 1]->sp : nullptr);
-            const strata::core::OnDevice on(st.dev);
-            void* sb = nullptr;              // this stage's own loan, out of its own cache
-            uint64_t sbb = 0;
-            // `first < 0`: no loan was taken (nothing was lendable), so this stage allocates its own buffers
-            if (i + 1 < pf_parts.size() && pf_parts[i + 1].first >= 0) {
-                sb = st.cache.device_slot(pf_parts[i + 1].first);
-                sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
-            }
-            if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), o.prefill_chunk, (void*) st.stream, err,
-                            sb, sbb)) {
-                std::fprintf(stderr, "strata serve: layer split, CUDA%d prompt path: %s\n", st.dev, err.c_str());
-                return 1;
-            }
+            st.sp.set_stage(st.lb, i + 1 < stages.size() ? st.le : -1,
+                            i + 1 < stages.size() ? &stages[i + 1]->sp : nullptr);
         }
         if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
-        if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes)) {
+        strata::prefill::InitResult prompt_result = strata::prefill::InitResult::error;
+        const bool prompt_ready = strata::prefill::init_pipeline(o.prefill_chunk, automatic_prefill,
+            stages.size() + 1,
+            [&](size_t i, int64_t chunk) {
+                err.clear();
+                if (i == 0) {
+                    sp.init(wt, g, ss, srcp, &xcache, host_res.data(), chunk, main_cs, err, borrow, borrow_bytes);
+                    return prompt_result = sp.init_result();
+                }
+                GpuStage& st = *stages[i - 1];
+                const strata::core::OnDevice on(st.dev);
+                void* sb = nullptr;
+                uint64_t sbb = 0;
+                if (i < pf_parts.size() && pf_parts[i].first >= 0) {
+                    sb = st.cache.device_slot(pf_parts[i].first);
+                    sbb = part_bytes(pf_parts[i], pf_parts[i].first);
+                }
+                st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), chunk, (void*) st.stream, err, sb, sbb);
+                if (st.sp.init_result() != strata::prefill::InitResult::ready)
+                    err = "CUDA" + std::to_string(st.dev) + ": " + err;
+                return prompt_result = st.sp.init_result();
+            },
+            [&](size_t i) { (i == 0 ? sp : stages[i - 1]->sp).reset(); },
+            [&](size_t i, int64_t from, int64_t to) {
+                std::fprintf(stderr, "strata serve: CUDA%d prompt allocation failed (%s); retrying all stages "
+                                     "with %lld -> %lld tokens\n", i == 0 ? 0 : stages[i - 1]->dev, err.c_str(),
+                             (long long) from, (long long) to);
+            });
+        if (!prompt_ready) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
-            if (err.find("fit") != std::string::npos)   // #85: say what frees VRAM
-                std::fprintf(stderr, "strata serve: the GPU has too little free VRAM for the prompt path: turn images "
-                                     "off (setup: --vision no), close other programs using the GPU, use a shorter "
-                                     "context, or read prompts in smaller chunks (--prefill 512)\n");
+            if (prompt_result == strata::prefill::InitResult::out_of_memory)
+                std::fprintf(stderr, "strata serve: try --prefill 256, a shorter context, or free GPU memory\n");
             return 1;
         }
         mem_mark("the head and the prompt path");
@@ -5066,10 +5097,21 @@ int main(int argc, char** argv) {
         }
         if (borrow == nullptr)
             std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
-        if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
-                          host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
-                          borrow_bytes)) {
+        strata::prefill::InitResult prompt_result = strata::prefill::InitResult::error;
+        if (!strata::prefill::init_pipeline(o.prefill_chunk, automatic_prefill, 1,
+                [&](size_t, int64_t chunk) {
+                    prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
+                                 host_res.empty() ? nullptr : host_res.data(), chunk, main_cs, err, borrow, borrow_bytes);
+                    return prompt_result = prefill.init_result();
+                },
+                [&](size_t) { prefill.reset(); },
+                [&](size_t, int64_t from, int64_t to) {
+                    std::fprintf(stderr, "strata generate: prompt allocation failed (%s); retrying with "
+                                         "%lld -> %lld tokens\n", err.c_str(), (long long) from, (long long) to);
+                })) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            if (prompt_result == strata::prefill::InitResult::out_of_memory)
+                std::fprintf(stderr, "strata generate: try --prefill 256 or free GPU memory\n");
             return 1;
         }
         if (!o.mtp.empty()) {
