@@ -43,6 +43,7 @@ import threading
 import time
 import urllib.request
 import uuid
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterator, Protocol
@@ -1460,6 +1461,19 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
+    @contextmanager
+    def _request_lock(self, cancel):
+        acquired = False
+        try:
+            while not cancel.is_set():
+                if self.fifo.acquire(timeout=0.1):
+                    acquired = True
+                    break
+            yield acquired
+        finally:
+            if acquired:
+                self.fifo.release()
+
     def run(self, ids, thinking, tools, max_new, sampling, cancel, prefix="", max_calls=None) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `prefix` is the forced answer opening already appended to ids; it must complete an offered tool call.
@@ -1479,15 +1493,22 @@ class Service:
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb = getattr(self.embeddings, "path", None)
-        # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
-        # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
-        engine_last0 = getattr(self.engine, "last", None)
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
         with self.status_lock:
             self.status["queued"] += 1
         try:
-            with self.fifo:
+            with self._request_lock(cancel) as acquired:
+                if not acquired:
+                    with self.status_lock:
+                        self.status["queued"] -= 1
+                    if emb:
+                        Path(emb).unlink(missing_ok=True)
+                    yield "done", {"finish": "cancel", "completion_tokens": 0, "timings": None}
+                    return
+                # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
+                # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
+                engine_last0 = getattr(self.engine, "last", None)
                 try:
                     with self.status_lock:
                         if trace is not None:

@@ -1889,20 +1889,20 @@ class StatusHandover(unittest.TestCase):
             def __init__(self):
                 self.lock, self.armed = threading.Lock(), False
 
-            def acquire(self, blocking=True):
-                return self.lock.acquire(blocking)
+            def acquire(self, blocking=True, timeout=-1):
+                return self.lock.acquire(blocking, timeout)
 
             def __enter__(self):
                 self.lock.acquire()
 
             def __exit__(self, *exc):
+                self.release()
+
+            def release(self):
                 self.lock.release()
                 if self.armed:
                     self.armed = False
                     second_running.wait(5)
-
-            def release(self):
-                self.lock.release()
 
         svc = Service(Engine(tok, "</think>\n\n" + "y" * 40, max_context=CTX), tok,
                       ChatTemplate(ROOT / "serve/chat_template.jinja"))
@@ -1940,6 +1940,34 @@ class StatusHandover(unittest.TestCase):
         self.assertEqual(svc.totals["output_tokens"], rows[0]["output_tokens"] + 20)
         self.assertFalse(svc.status["busy"])
         self.assertNotIn("tail", svc.status)
+
+    def test_waiting_request_does_not_claim_previous_engine_timings(self):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, "abc", max_context=CTX)
+        engine.last = {"generated": 4, "decode_ms": 40}
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+
+        class QueueLock:
+            def acquire(self, timeout=None):
+                # The previous request finishes while this request waits to acquire FIFO.
+                engine.last = {"generated": 8, "decode_ms": 80}
+                return True
+
+            def release(self):
+                pass
+
+            def __enter__(self):
+                return self.acquire()
+
+            def __exit__(self, *exc):
+                self.release()
+
+        svc.fifo = QueueLock()
+        list(svc.run([1], False, None, 2, {}, threading.Event()))
+        self.assertIsNone(svc.history[0]["engine_generated"])
+        self.assertEqual(svc.totals["decode_ms"], 0)
+
+
 
 
 FAKE_STRATA = '''import pathlib, sys, time

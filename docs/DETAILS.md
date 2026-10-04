@@ -981,6 +981,9 @@ Open `/api-monitor` to inspect API traffic without opening a chat. It shows the 
 load/unload controls, active/queued requests, original request bodies, output, separate reasoning and
 non-stream response bodies. Total wall-clock includes FIFO waits and automatic loading; load, queue,
 first-token, prompt/output tokens and engine decode timing are shown separately.
+Queued generation requests honor client cancellation without loading or using the engine. A failed request without
+its own engine `DONE` line never inherits the previous request's decode counters in history or totals.
+
 
 `GET /api/requests` returns compact summaries; `GET /api/requests?id=<id>` returns one retained request.
 Both use the existing API-key check. The monitor retains the newest **100 requests in memory** until restart,
