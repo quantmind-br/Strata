@@ -455,6 +455,18 @@ r = client.chat.completions.create(model="strata", messages=[{"role": "user", "c
 print(r.choices[0].message.content)
 ```
 
+- **Validated request controls.** Sampling numbers must be finite; `top_k` is an integer 1..64 and `seed` is an
+  integer 0..2**64-1 (including a reproducible `0`). Invalid controls return HTTP 400 with the offending `param`.
+  OpenAI `stop` and Anthropic `stop_sequences` accept a nonempty string or one to four nonempty strings; the stop
+  text and everything after it are omitted, even when a delimiter spans generated tokens.
+- **Tool policy.** OpenAI `tool_choice: "required"` or a named function, and Anthropic `any` or a named `tool`,
+  force an offered tool call with thinking disabled. A forced call that names an unoffered tool or never completes
+  is an error, not a plain-text answer. OpenAI `parallel_tool_calls: false` and Anthropic
+  `disable_parallel_tool_use: true` stop after one complete call while retaining incremental argument streaming.
+  Forced choices and single-call limits cannot be combined with server-side MCP tools. Structured `response_format`
+  remains supported by the structured-output path; constrained JSON with tools/MCP remains unsupported.
+  Request timings include the effective sampling settings and engine information when engine timings are available.
+
 - **Thinking levels: none, low, medium, high.** The model thinks before it answers (streamed as
   `reasoning_content`, Anthropic: `thinking` blocks). Choose how much per request - in the chat page (the "Thinking"
   menu), in `chat.py` (`/think low`), or over the API:

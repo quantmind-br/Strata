@@ -28,6 +28,7 @@ import hmac
 import codecs
 import ctypes
 import json
+import math
 import os
 import queue
 import re
@@ -55,6 +56,8 @@ from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_mess
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
+from serve.controls import (RequestError, validate_request, validate_sampling, stop_sequences,  # noqa: E402
+                            tool_policy, StopFilter)
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -446,6 +449,7 @@ class StrataEngine:
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
+        validate_sampling(sampling)
         keys = ""
         t = sampling.get("temperature")
         if isinstance(t, (int, float)) and float(t) > 0.0:
@@ -454,9 +458,8 @@ class StrataEngine:
         if isinstance(tp, (int, float)) and float(tp) < 1.0:
             keys += f" top_p={float(tp)!r}"
         tk = sampling.get("top_k")
-        if isinstance(tk, int) and not isinstance(tk, bool) and tk >= 0:
-            # the engine's sampled path keeps at most 64 candidates: 0 ("off") and wider lists get all 64
-            keys += f" top_k={tk if 1 <= tk <= 64 else 64}"
+        if type(tk) is int:
+            keys += f" top_k={tk}"
         mp = sampling.get("min_p")
         if isinstance(mp, (int, float)) and 0.0 < float(mp) <= 1.0:
             keys += f" min_p={float(mp)!r}"
@@ -480,7 +483,7 @@ class StrataEngine:
             else:
                 keys += " penalty_last_n=64"
         seed = sampling.get("seed")
-        if isinstance(seed, int) and seed > 0:
+        if type(seed) is int and seed >= 0:
             keys += f" seed={seed}"
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
@@ -1364,10 +1367,10 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
-    def prepare(self, messages, tools, kwargs, max_new=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, prefix=""):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
-        prompt = self.template.render(messages, tools=tools, **kwargs)
+        prompt = self.template.render(messages, tools=tools, **kwargs) + prefix
         ids = self.tok.encode(prompt, parse_special=True)
         self.embeddings.path = None
         images = images_of(messages)
@@ -1457,14 +1460,21 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
-    def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
-        """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
+    def run(self, ids, thinking, tools, max_new, sampling, cancel, prefix="", max_calls=None) -> Iterator[tuple[str, object]]:
+        """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
+        `prefix` is the forced answer opening already appended to ids; it must complete an offered tool call.
+        `max_calls` ends generation after that many complete calls, without returning trailing output."""
         budget = self.reasoning_budget(sampling) if thinking else None   # #123: opt-in, off by default
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        validate_sampling(sampling or {})
+        stopper = StopFilter(stop_sequences(sampling or {}))
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        prefix_events = parser.feed(prefix) if prefix else []
+        offered = {t.get("name") for t in tools or []}
+        calls, limited, refused = 0, False, None
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
@@ -1494,8 +1504,16 @@ class Service:
                         self.rate.clear()               # the previous request's samples must not leak into this one
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
+                    for ev in prefix_events:
+                        if ev.kind in ("tool_start", "tool_call") and ev.call.name not in offered:
+                            refused = f"the forced tool call named {ev.call.name!r}, which the request does not offer"
+                            finish = "error"
+                            break
+                        if ev.kind == "tool_call":
+                            calls += 1
+                        yield "event", ev
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
-                    while True:
+                    while not refused:
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
@@ -1515,11 +1533,26 @@ class Service:
                                     break
                                 raw_ids.append(t)
                                 seg.append(t)
-                                evs = parser.feed(detok.push(t))
+                                evs = parser.feed(stopper.feed(detok.push(t)))
                                 self._note(n, evs)
                                 last_print = self._progress(last_print)
                                 for ev in evs:
+                                    if prefix and ev.kind in ("tool_start", "tool_call") and ev.call.name not in offered:
+                                        refused = f"the forced tool call named {ev.call.name!r}, which the request does not offer"
+                                        finish = "error"
+                                        break
+                                    if ev.kind == "tool_call":
+                                        calls += 1
                                     yield "event", ev
+                                    if max_calls and calls >= max_calls:
+                                        limited = True
+                                        finish = "stop"
+                                        break
+                                if refused or limited:
+                                    break
+                                if stopper.matched is not None:
+                                    finish = "stop"
+                                    break
                                 if budget and parser.state == "reasoning":
                                     thought += 1
                                     # at a clean point: no tag held back, no character split across tokens
@@ -1561,10 +1594,27 @@ class Service:
                         for t in extra:
                             n += 1
                             raw_ids.append(t)
-                            evs = parser.feed(detok.push(t))
+                            evs = parser.feed(stopper.feed(detok.push(t)))
                             self._note(n, evs)
                             for ev in evs:
+                                if prefix and ev.kind in ("tool_start", "tool_call") and ev.call.name not in offered:
+                                    refused = f"the forced tool call named {ev.call.name!r}, which the request does not offer"
+                                    finish = "error"
+                                    break
+                                if ev.kind == "tool_call":
+                                    calls += 1
                                 yield "event", ev
+                                if max_calls and calls >= max_calls:
+                                    limited = True
+                                    finish = "stop"
+                                    break
+                            if refused or limited:
+                                break
+                            if stopper.matched is not None:
+                                finish = "stop"
+                                break
+                        if refused or limited or stopper.matched is not None:
+                            break
                         prompt = prompt + seg + extra
                     if cancel.is_set():
                         finish = "cancel"
@@ -1613,6 +1663,12 @@ class Service:
                             fresh = getattr(self.engine, "last", None)
                             if fresh is not None and fresh is not before:      # the engine's clock for THIS request
                                 timings = request_timings(seen, n, last)
+                                if timings:
+                                    timings["effective_settings"] = {
+                                        k: sampling[k] for k in ("seed", "temperature", "top_k", "top_p", "min_p",
+                                                                 "reasoning_effort", "strata_tune")
+                                        if k in (sampling or {})}
+                                    timings["engine_info"] = dict(getattr(self.engine, "info", {}) or {})
                                 self.last_timings = dict(timings, at=int(time.time())) if timings else None
                             self.last_request_at = time.time()
                             now = time.time()
@@ -1634,8 +1690,21 @@ class Service:
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
-        for ev in parser.finish():
-            yield "event", ev
+        if refused:
+            raise ValueError(refused)
+        if not cancel.is_set() and not limited:
+            tail = parser.feed(stopper.finish()) + parser.finish()
+            if prefix and not calls and not any(ev.kind == "tool_call" for ev in tail):
+                raise ValueError(f"the forced tool call did not complete ({finish}); no answer is returned")
+            for ev in tail:
+                if prefix and ev.kind in ("tool_start", "tool_call") and ev.call.name not in offered:
+                    raise ValueError(f"the forced tool call named {ev.call.name!r}, which the request does not offer")
+                if ev.kind == "tool_call":
+                    calls += 1
+                yield "event", ev
+                if max_calls and calls >= max_calls:
+                    finish = "stop"
+                    break
         yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
                        "timings": timings}
 
@@ -1775,7 +1844,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
 
 
 # ------------------------------------------------------------------------------------------------ OpenAI
-def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None):
+def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, policy=("", None)):
     """`run`: the events to send instead of Service.run's (run_with_mcp); its ("mcp", {...}) items become chunks with
     an empty delta and a `strata_mcp` field, which only the web app reads."""
     cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
@@ -1789,7 +1858,7 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
-    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel):
+    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel, *policy):
         if kind == "ping":
             yield None
         elif kind == "mcp":
@@ -1900,7 +1969,7 @@ def structured_chunks(chunks, validator):
 
 
 # ------------------------------------------------------------------------------------------------ Anthropic
-def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel):
+def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, policy=("", None)):
     mid = "msg_" + uuid.uuid4().hex[:24]
     yield "message_start", {"type": "message_start", "message": {
         "id": mid, "type": "message", "role": "assistant", "model": svc.model_for(req), "content": [],
@@ -1911,7 +1980,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         return ("content_block_stop", {"type": "content_block_stop", "index": index})
 
     streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came (#211)
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
+    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, *policy):
         if kind == "ping":
             yield None
             continue
@@ -2278,6 +2347,8 @@ def make_handler(svc: Service):
                 req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
+                if path in ("/v1/chat/completions", "/v1/messages"):
+                    validate_request(req, "openai" if path.endswith("completions") else "anthropic")
                 if path in ("/v1/load", "/v1/unload"):
                     if not self._own_page("the model can be loaded or unloaded"):
                         return
@@ -2313,7 +2384,8 @@ def make_handler(svc: Service):
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except ValueError as e:
-                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e),
+                                          "param": getattr(e, "param", None)}})
             except ModelBusy as e:
                 self._json(409, {"error": {"type": "model_busy", "message": str(e)}})
             except StructuredOutputError as e:
@@ -2458,13 +2530,16 @@ def make_handler(svc: Service):
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            policy = tool_policy(req, "openai")
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, policy[0])
+            if policy[0] and thinking:
+                raise RequestError("tool_choice", "forcing a tool call needs thinking off (reasoning_effort none)")
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run)
+            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, policy=policy)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
@@ -2510,11 +2585,14 @@ def make_handler(svc: Service):
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            policy = tool_policy(req, "anthropic")
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, policy[0])
+            if policy[0] and thinking:
+                raise RequestError("tool_choice", "forcing a tool call needs thinking off (thinking disabled)")
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431
-            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
+            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, policy)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
@@ -2772,7 +2850,8 @@ def clean_shared_defaults(d) -> dict:
     for key, value in d.items():
         if value is None or value == "":
             continue
-        number = isinstance(value, (int, float)) and not isinstance(value, bool)
+        number = isinstance(value, (int, float)) and not isinstance(value, bool) and (
+            not isinstance(value, float) or math.isfinite(value))
         if key == "reasoning_effort":
             if value not in ("none", "low", "medium", "high"):
                 raise ValueError("reasoning_effort: none, low, medium or high")
@@ -2783,12 +2862,13 @@ def clean_shared_defaults(d) -> dict:
             if not number or not 0 < value <= 1:
                 raise ValueError("top_p: 0 < top_p <= 1")
         elif key == "top_k":
-            if not number or value != int(value) or not 1 <= value <= 64:
+            if not number or type(value) is not int or not 1 <= value <= 64:
                 raise ValueError("top_k: an integer 1..64")
             value = int(value)
         elif key in ("seed", "max_tokens"):
-            if not number or value != int(value) or value <= 0:
-                raise ValueError(f"{key}: a positive integer")
+            if not number or type(value) is not int or value < (0 if key == "seed" else 1) or (
+                    key == "seed" and value > 2**64 - 1):
+                raise ValueError(f"{key}: " + ("an integer 0..2**64-1" if key == "seed" else "a positive integer"))
             value = int(value)
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
@@ -2810,7 +2890,8 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     for key, value in (cfg.get("sampling") or {}).items():
         if value is None:
             continue
-        number = isinstance(value, (int, float)) and not isinstance(value, bool)
+        number = isinstance(value, (int, float)) and not isinstance(value, bool) and (
+            not isinstance(value, float) or math.isfinite(value))
         if key == "temperature":
             if not number or value < 0:
                 raise SystemExit(f"[strata] config sampling.temperature={value!r}: expected a number >= 0 (0 = greedy)")
@@ -2824,7 +2905,7 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
                 raise SystemExit(f"[strata] config sampling.min_p={value!r}: expected 0 <= min_p <= 1")
             out[key] = float(value)
         elif key == "top_k":
-            if not number or value != int(value) or not 1 <= value <= 64:
+            if not number or type(value) is not int or not 1 <= value <= 64:
                 raise SystemExit(f"[strata] config sampling.top_k={value!r}: the sampled path takes an integer 1..64")
             out[key] = int(value)
         elif key == "presence_penalty":
@@ -2840,12 +2921,12 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
                 raise SystemExit(f"[strata] config sampling.repetition_penalty={value!r}: expected a number > 0 (1 = off)")
             out[key] = float(value)
         elif key == "penalty_last_n":
-            if not number or value != int(value) or value < 0:
-                raise SystemExit(f"[strata] config sampling.penalty_last_n={value!r}: expected a non-negative integer")
+            if not number or type(value) is not int or value < 1:
+                raise SystemExit(f"[strata] config sampling.penalty_last_n={value!r}: expected a positive integer")
             out[key] = int(value)
         elif key == "seed":
-            if not number or value != int(value) or value <= 0:
-                raise SystemExit(f"[strata] config sampling.seed={value!r}: expected a positive integer")
+            if not number or type(value) is not int or not 0 <= value <= 2**64 - 1:
+                raise SystemExit(f"[strata] config sampling.seed={value!r}: expected an integer 0..2**64-1")
             out[key] = int(value)
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
