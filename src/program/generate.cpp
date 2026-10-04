@@ -2334,7 +2334,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d weights: %s (%llu MiB needed, %llu MiB of %llu "
                                  "MiB free on that card)\n", st.dev,
                          err.empty() ? "the weight arena does not fit" : err.c_str(),
-                         (unsigned long long) (pool_bytes >> 20), (unsigned long long) (free_b >> 20),
+                         (unsigned long long) (stage_pool_bytes >> 20), (unsigned long long) (free_b >> 20),
                          (unsigned long long) (total_b >> 20));
             return 1;
         }
