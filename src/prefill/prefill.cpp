@@ -218,11 +218,16 @@ void prompt_thermal_gate(int device, const std::function<bool()>& should_stop) {
     const auto& gate = strata::platform::thermal_gate();
     if (gate.pause_c <= 0) return;
     const auto t0 = Clock::now();
+    int heartbeat_steps = 0;
     const auto w = strata::platform::thermal_wait(gate, [&] { return gpu_temperature_c(device); },
         [&] { return should_stop && should_stop(); },
-        [](int ms) {
+        [&](int ms) {
             core::progress_at("waiting for prompt GPU cooling");
             core::progress_beat();
+            if (heartbeat_steps++ % 25 == 0) {
+                std::printf("INFO thermal_wait_device=%d\n", device);
+                std::fflush(stdout);
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(ms));
         });
     if (w.steps > 0)
