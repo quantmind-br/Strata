@@ -778,6 +778,36 @@ def gpu_list(cfg: dict) -> list[int]:
     return [int(str(x).strip()) for x in items if str(x).strip() != ""]
 
 
+def managed_config(cfg: dict, model: str | None, max_context: int | None) -> dict:
+    """Validate a launcher's model against the prepared pack and apply its context.
+
+    Never substitute the native model: pack, PLE weights and tokenizer must match
+    it. Return a copy so CLI overrides do not rewrite the setup/shared settings.
+    """
+    args = list(cfg.get("args", []))
+    if model is not None:
+        native = [i for i, value in enumerate(args) if value == "--native"]
+        if len(native) != 1 or native[0] + 1 >= len(args):
+            raise ValueError("--model requires exactly one --native model in the config")
+        path = Path(args[native[0] + 1])
+        if not path.is_absolute():
+            path = Path(cfg.get("cwd") or Path.cwd()) / path
+        if path.resolve() != Path(model).resolve():
+            raise ValueError("--model does not match the config's --native model; select its matching prepared config")
+    if max_context is not None:
+        if max_context < 1:
+            raise ValueError("--max-context must be positive")
+        # Native options use separate tokens. Remove all prior occurrences so
+        # the engine and HTTP budget cannot disagree about which value wins.
+        indices = [i for i, value in enumerate(args) if value == "--max-context"]
+        for i in reversed(indices):
+            if i + 1 >= len(args) or args[i + 1].startswith("--"):
+                raise ValueError("--max-context in the config is missing its value")
+            del args[i:i + 2]
+        args += ["--max-context", str(max_context)]
+    return {**cfg, "args": args}
+
+
 def engine_silence_s(cfg: dict) -> float:
     """#481: the config's "engine_silence_s" - seconds an engine may print nothing during a request before the server
     ends it (default ENGINE_SILENCE_S; 0 = wait forever).  ValueError for anything but a number >= 0."""
@@ -2832,6 +2862,8 @@ def main() -> int:
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
                                      "written by setup.py")
+    ap.add_argument("--model", help="verify this native GGUF matches --native in the prepared config (managed launchers)")
+    ap.add_argument("--max-context", type=int, help="override the engine context in tokens; omit to use the config")
     ap.add_argument("--host", default=None,
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other devices "
                          "on your network (set an API key); also \"host\" in the config")
@@ -2867,6 +2899,13 @@ def main() -> int:
                                           "server's model; also \"before_load\" in the config, a string or a list)")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    if a.model is not None or a.max_context is not None:
+        if a.engine != "strata" or not a.config:
+            ap.error("--model and --max-context require --engine strata and --config")
+        try:
+            cfg = managed_config(cfg, a.model, a.max_context)
+        except ValueError as exc:
+            ap.error(str(exc))
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
