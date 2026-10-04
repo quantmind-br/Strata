@@ -1,4 +1,5 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
+#include "strata/platform/helper_affinity.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
@@ -250,7 +251,7 @@ struct Stager {
             if (cudaEventCreateWithFlags(&dma_done[i], cudaEventDisableTiming) != cudaSuccess) return false;
         }
         cudaGetDevice(&device);
-        for (int t = 0; t < nthreads; ++t) threads.emplace_back([this] { work(); });
+        for (int t = 0; t < nthreads; ++t) threads.emplace_back([this] { strata::platform::apply_helper_affinity(); work(); });
         return true;
     }
     ~Stager() {
@@ -1426,6 +1427,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // layer 1 on, and gathering them here first left the GPU idle for the whole read (~0.4 s of a 32K prompt)
         if (ple_on && !ple_next.valid())
             ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c0, b = ple_buf] {
+                strata::platform::apply_helper_affinity();
                 return ple_gather(c0, b, ple_next_err);
             });
         bool ple_pending = ple_on;
@@ -1451,6 +1453,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     return false;
                 }
                 ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
+                    strata::platform::apply_helper_affinity();
                     return ple_gather(c1, b, ple_next_err);
                 });
             }
@@ -1595,6 +1598,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         const bool threaded_issue = stream_all && issuer_on;
         if (threaded_issue) {
             issuer = std::thread([&] {
+                strata::platform::apply_helper_affinity();
                 const core::OnDevice od(m.device);
                 for (size_t idx = 0; idx < seq.size(); ++idx) {
                     while (idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {
@@ -2610,6 +2614,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
             next_->hand_in_ = h;
             next_run = std::async(std::launch::async, [this, tokens, c0, T, p0, &next_err] {
+                strata::platform::apply_helper_affinity();
                 return next_->run(tokens + c0, T, p0, next_err);
             });
             hand_buf ^= 1;

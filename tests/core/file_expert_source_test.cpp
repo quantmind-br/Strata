@@ -1,4 +1,5 @@
 #include "strata/core/expert_source.hpp"
+#include "strata/platform/helper_affinity.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
@@ -288,6 +289,26 @@ void test_cgroup_memory_budget() {
             "missing memory.stat counters did not fail closed");
 }
 
+void test_helper_affinity() {
+#if defined(__linux__)
+    cpu_set_t original;
+    require(sched_getaffinity(0, sizeof original, &original) == 0, "read allowed CPUs");
+    int host = 0;
+    while (host < CPU_SETSIZE && !CPU_ISSET(host, &original)) ++host;
+    require(strata::platform::capture_helper_affinity(host), "capture helper affinity");
+    cpu_set_t singleton; CPU_ZERO(&singleton); CPU_SET(host, &singleton);
+    require(sched_setaffinity(0, sizeof singleton, &singleton) == 0, "pin service fixture");
+    strata::platform::apply_helper_affinity();
+    cpu_set_t helpers; const int rc = sched_getaffinity(0, sizeof helpers, &helpers);
+    require(sched_setaffinity(0, sizeof original, &original) == 0, "restore fixture affinity");
+    require(rc == 0 && CPU_COUNT(&helpers) > 0, "helper mask is empty");
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+        require(!CPU_ISSET(cpu, &helpers) || CPU_ISSET(cpu, &original), "helper escaped original allowed set");
+    if (CPU_COUNT(&original) > 2) require(!CPU_ISSET(host, &helpers), "helper inherited service pin");
+#endif
+}
+
+
 }  // namespace
 
 int main() {
@@ -296,6 +317,7 @@ int main() {
         test_resident_lend_region();
         test_resident_exchange();
         test_cgroup_memory_budget();
+        test_helper_affinity();
         test_canonical_layout();
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();

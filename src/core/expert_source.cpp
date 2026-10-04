@@ -1,3 +1,4 @@
+#include "strata/platform/helper_affinity.hpp"
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
 #include "strata/core/remote_experts.hpp"
@@ -830,7 +831,7 @@ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
         };
         const size_t nt = std::min<size_t>(4, (todo.size() + 15) / 16);
         std::vector<std::thread> th;
-        for (size_t t = 1; t < nt; ++t) th.emplace_back(work);
+        for (size_t t = 1; t < nt; ++t) th.emplace_back([&] { strata::platform::apply_helper_affinity(); work(); });
         work();
         for (auto& t : th) t.join();
         return;
@@ -867,7 +868,7 @@ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
     };
     const size_t nt = std::min<size_t>(todo.size(), (size_t) fetch_threads_);
     std::vector<std::thread> th;
-    for (size_t t = 1; t < nt; ++t) th.emplace_back(work);
+    for (size_t t = 1; t < nt; ++t) th.emplace_back([&] { strata::platform::apply_helper_affinity(); work(); });
     work();
     for (auto& t : th) t.join();
 }
@@ -1553,7 +1554,7 @@ bool FileExpertSource::pin_cache_complement(
     {
         const int threads = (int) std::max<int64_t>(1, std::min<int64_t>(6, n_layers_));
         std::vector<std::thread> pool;
-        for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
+        for (int i = 1; i < threads; ++i) pool.emplace_back([&] { strata::platform::apply_helper_affinity(); worker(); });
         worker();
         for (auto& t : pool) t.join();
     }
