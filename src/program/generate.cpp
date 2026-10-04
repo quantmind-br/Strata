@@ -3310,7 +3310,10 @@ int main(int argc, char** argv) {
         std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
         bool ok = true;
         for (int64_t l = 0; l < g.n_layers && ok; ++l) {
-            const strata::core::WeightRef* w = wt.find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
+            const int stn = o.stage_dense && multi_gpu ? stage_of(l) : 0;
+            GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
+            const strata::core::OnDevice on(gs ? gs->dev : -1);
+            const strata::core::WeightRef* w = (gs ? gs->wt : wt).find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
             ok = w != nullptr && w->kind == strata::core::WeightKind::Bf16InF32 &&
                  w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 2;
             if (!ok) break;

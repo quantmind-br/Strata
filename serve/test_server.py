@@ -2262,6 +2262,23 @@ class SilentEngine(unittest.TestCase):
         self.assertEqual(list(engine.generate([1] * 100, 10, {}, threading.Event())), [None])
         engine.proc.kill.assert_not_called()
 
+    def test_thermal_heartbeat_keeps_http_stream_alive(self):
+        engine = self.bare(0.3, can_stop=True)
+        engine.lines.put("INFO thermal_wait_device=1")
+        engine.lines.put("DONE 0 1 1 0 length")
+        self.assertEqual(list(engine.generate([1], 10, {}, threading.Event())), [None])
+        engine.proc.kill.assert_not_called()
+
+    def test_thermal_heartbeat_forwards_cancel_before_next_chunk(self):
+        engine = self.bare(0.3, can_stop=True)
+        engine.lines.put("INFO thermal_wait_device=1")
+        engine.lines.put("DONE 0 1 1 0 cancel")
+        cancel = threading.Event()
+        cancel.set()
+        self.assertEqual(list(engine.generate([1], 10, {}, cancel)), [])
+        self.assertIn("STOP\n", engine.proc.stdin.getvalue())
+        engine.proc.kill.assert_not_called()
+
     def test_a_stop_never_acknowledged(self):
         from serve.server import EngineSilent
         engine = self.bare(0.3, can_stop=True)

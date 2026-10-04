@@ -155,6 +155,15 @@ from the GGUF gave identical tokens and logits. An expert read from the GGUF is 
 engine fetches a layer's missing experts on 8 threads (`STRATA_FETCH_THREADS`) with one batched page request
 (Windows `PrefetchVirtualMemory`). With an `experts.bin` in the pack, nothing changes. Setup does not use this yet.
 
+For an explicit multi-GPU layer split, the opt-in `--stage-dense` flag stores each layer's dense weights only
+on its owning stage. Routing lookahead reads every router from that stage, including direct-GGUF packs
+without `experts.bin`. Automatic splits and single-GPU launches reject this flag.
+
+On Linux NVIDIA GPUs, `STRATA_PREFILL_TEMP_PAUSE_C` enables cooling pauses between prompt chunks;
+`STRATA_PREFILL_TEMP_RESUME_C` sets the resume temperature and `STRATA_PREFILL_TEMP_MAX_WAIT_S` bounds the wait.
+An unset or nonpositive pause threshold disables the gate. Thermal heartbeats keep streaming connections
+alive and forward cancellation to the engine while either stage waits for cooling.
+
 **Creating native packs with `tools/iq_pack.py`:** choose a new `--out` directory. The CLI builds in a staging
 directory and publishes the complete pack atomically, with `PACK.json` recording source/converter identities
 and artifact hashes. Repeating the same conversion verifies and reuses an identical pack without rewriting it.

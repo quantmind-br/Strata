@@ -560,6 +560,10 @@ class StrataEngine:
                     if cancel.is_set():                   # lines reset the 10 s wait, so without this a long prompt
                         return                            # would send no keep-alives at all)
                     yield None
+                elif line.startswith("INFO thermal_wait_device="):
+                    if cancel.is_set():
+                        return
+                    yield None
                 elif line.startswith("RESUME "):          # the reused tokens: the first chunk starts after them
                     try:
                         read_to = int(line.split()[1])
