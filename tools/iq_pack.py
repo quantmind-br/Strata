@@ -3,6 +3,10 @@
     python tools/iq_pack.py --gguf <model>-00001-of-00002.gguf --out pack/iq3_xxs            (standalone)
     python tools/iq_pack.py --gguf <model>-00001-of-00002.gguf --base pack/full --out ...    (share dense.bin)
 
+The CLI publishes a new pack atomically under a per-destination flock. PACK.json records source and converter
+SHA256 identities and all artifact hashes. An identical verified destination is reused without rewriting;
+legacy, changed or damaged destinations are preserved and refused (choose a new --out).
+
 The i-quant experts cannot be re-expressed in the Q2_0 pack form, so this pack keeps every quantized tensor in
 its GGUF form:
 
@@ -41,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import fcntl
 import json
 import os
 import pathlib
@@ -48,6 +53,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 import numpy as np
 
@@ -495,7 +501,7 @@ def main() -> int:
     ap.add_argument("--gguf", required=True, help="the model's shard 1")
     ap.add_argument("--base", help="optional: a Q2_0 canonical pack whose dense.bin holds the shared float tensors")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--skip-experts", action="store_true", help="rewrite the index only")
+    ap.add_argument("--skip-experts", action="store_true", help="omit experts.bin from the new pack")
     ap.add_argument("--compat-bf16", action="store_true",
                     help="dequantize small non-native projections to BF16 for ordinary Qwen4Exp GGUFs "
                          "(rounds weights; leaves experts and the PLE table unchanged)")
@@ -504,6 +510,113 @@ def main() -> int:
     a = ap.parse_args()
     if a.compat_bf16 and a.base:
         ap.error("--compat-bf16 cannot reuse --base dense weights")
+    destination = pathlib.Path(a.out).absolute()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    # Serialize verification and atomic publication for cooperating writers.
+    with open(destination.parent / ("." + destination.name + ".pack.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return transactional_pack(a, destination)
+
+
+def source_stamp(path):
+    stat = path.stat()
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+def file_identity(path):
+    path = pathlib.Path(path)
+    digest = hashlib.sha256()
+    before = source_stamp(path)
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 << 20), b""):
+            digest.update(chunk)
+    after = source_stamp(path)
+    if before != after:
+        raise ValueError(f"source changed during hashing: {path}")
+    return {"size": after[2], "sha256": digest.hexdigest()}
+
+
+def tree_identity(root):
+    return {str(p.relative_to(root)): file_identity(p) for p in sorted(root.rglob("*"))
+            if p.is_file() and p.name != "PACK.json"}
+
+
+def converter_paths():
+    from _paths import add_gguf_py
+    add_gguf_py()
+    import gguf
+    paths = {name: HERE / name for name in
+             ("iq_pack.py", "strata_tokenizer.py", "gguf_reader.py", "_paths.py")}
+    # Hash the actual imported package, not just the resolver or an assumed checkout.
+    # Its complete Python source tree covers quants and their transitive dependencies,
+    # including dependencies imported lazily for particular quantization formats.
+    package = pathlib.Path(gguf.__file__).resolve().parent
+    paths.update({"gguf/" + p.relative_to(package).as_posix(): p
+                  for p in sorted(package.rglob("*.py")) if p.is_file()})
+    return paths
+
+
+def transactional_pack(a, destination):
+    src = pathlib.Path(a.gguf).absolute()
+    paths = list(Model(src).paths)
+    converter = converter_paths()
+    base = pathlib.Path(a.base).resolve() if a.base else None
+    inputs = paths + list(converter.values())
+    if base:
+        inputs += [p for p in sorted(base.rglob("*")) if p.is_file() and p.name != "PACK.json"]
+    stamps = {p: source_stamp(p) for p in inputs}
+    identity = {"format": 1, "sources": {str(p): file_identity(p) for p in paths},
+                "converter": {name: file_identity(p) for name, p in converter.items()},
+                "compat_bf16": a.compat_bf16, "experts_bin": a.experts_bin and not a.skip_experts,
+                "base": tree_identity(base) if base else None}
+    if destination.exists():
+        manifest = destination / "PACK.json"
+        if not manifest.exists():
+            raise ValueError(f"{destination}: legacy/unverified pack; choose a new --out (existing pack preserved)")
+        previous = json.loads(manifest.read_text())
+        if previous.get("identity") != identity:
+            raise ValueError(f"{destination}: source/options/converter identity mismatch; choose a new --out")
+        if previous.get("artifacts") != tree_identity(destination):
+            raise ValueError(f"{destination}: artifact integrity mismatch; existing pack preserved")
+        print("verified identical pack; no files rewritten")
+        return 0
+    with tempfile.TemporaryDirectory(prefix=".stage-" + destination.name + "-", dir=destination.parent) as tmp:
+        stage = pathlib.Path(tmp) / "pack"
+        original = a.out
+        try:
+            a.out = str(stage)
+            rc = build_pack(a)
+        finally:
+            a.out = original
+        if rc:
+            return rc
+        for path, before in stamps.items():
+            if source_stamp(path) != before:
+                raise ValueError(f"source changed during conversion: {path}")
+        manifest = {"identity": identity, "artifacts": tree_identity(stage)}
+        (stage / "PACK.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        for path in stage.rglob("*"):
+            if path.is_file():
+                with path.open("rb") as stream:
+                    os.fsync(stream.fileno())
+        directories = sorted((p for p in stage.rglob("*") if p.is_dir()),
+                             key=lambda p: len(p.parts), reverse=True)
+        for directory in directories + [stage]:
+            fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        stage.rename(destination)
+        fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    return 0
+
+
+def build_pack(a) -> int:
     # HF snapshot files are symlinks to hash-named blobs. Keep the shard filename for discovery: .absolute(), not
     # .resolve(), which would follow the link to the blob and lose the -0000N-of-0000M name.
     src = pathlib.Path(a.gguf).absolute()

@@ -37,6 +37,35 @@ def write_gguf(path, tensors, split=None, arch=True):
 
 
 class CompatibilityTests(unittest.TestCase):
+    def test_quantized_ple_conversion_preserves_source_payload(self):
+        # Unlike v6, upstream serves only Q2_0/Q8_0 keys natively. IQ keys
+        # retain their GGUF payload but their pack projection must be BF16.
+        for kind, block_bytes in [(Q.IQ3_XXS, 98), (Q.IQ4_XS, 136)]:
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / "key.gguf"
+                raw = np.arange(2 * block_bytes, dtype=np.uint8).reshape(2, block_bytes)
+                raw[:, :2] = np.frombuffer(np.float16(0.01).tobytes(), dtype=np.uint8)
+                writer = GGUFWriter(source, "qwen4exp")
+                writer.add_tensor("blk.1.ple_key.weight", raw, raw_dtype=kind)
+                writer.write_header_to_file()
+                writer.write_kv_data_to_file()
+                writer.write_tensors_to_file()
+                writer.close()
+                original = source.read_bytes()
+                model = iq_pack.Model(source)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(iq_pack.index_standalone(source, root, model, True), 0)
+                _, rows = iq_pack.read_index(root / "index.txt")
+                self.assertEqual(rows["blk.1.ple_key.weight"][2], "4")
+                self.assertEqual(rows["blk.1.ple_key.weight"][7:9], ["256", "2"])
+                self.assertEqual((root / "dense.bin").read_bytes(),
+                                 iq_pack.bf16_bytes(raw.reshape(-1), kind.name))
+                conversions = json.loads((root / "conversions.json").read_text())["tensors"]
+                self.assertEqual([t["name"] for t in conversions], ["blk.1.ple_key.weight"])
+                self.assertEqual(model.bytes("blk.1.ple_key.weight").tobytes(), raw.tobytes())
+                self.assertEqual(source.read_bytes(), original)
+
     def test_bf16_halfway_rounds_to_even(self):
         values = np.array([0x3F808000, 0x3F818000, 0xBF808000, 0xBF818000], dtype=np.uint32)
         got = np.frombuffer(iq_pack.bf16_bytes(values.view(np.uint8), "F32"), dtype=np.uint16)
@@ -149,7 +178,9 @@ class CompatibilityTests(unittest.TestCase):
                 log = io.StringIO()
                 argv = ["iq_pack.py", "--gguf", str(path), "--out", str(out), "--experts-bin"]
                 with patch.object(sys, "argv", argv), contextlib.redirect_stdout(log):
-                    self.assertEqual(iq_pack.main(), 0)
+                    self.assertEqual(iq_pack.build_pack(iq_pack.argparse.Namespace(
+                        gguf=str(path), out=str(out), base=None, compat_bf16=False,
+                        experts_bin=True, skip_experts=False)), 0)
                 return log.getvalue()
 
             first = model("a.gguf", 1)
@@ -187,10 +218,13 @@ class CompatibilityTests(unittest.TestCase):
                 iq_pack.Model(first)
             second.symlink_to(root / "blob2")
             out = root / "pack"
-            (out / "tokenizer").mkdir(parents=True)
-            for name in ["vocab.json", "chat_template.jinja"]:
-                (out / "tokenizer" / name).touch()
-            with patch.object(sys, "argv", ["iq_pack.py", "--gguf", str(first), "--out", str(out), "--compat-bf16"]):
+            def tokenizer_export(cmd, **kwargs):
+                target = Path(cmd[cmd.index("--out") + 1]) / "tokenizer"
+                target.mkdir(parents=True)
+                for name in ["vocab.json", "chat_template.jinja"]:
+                    (target / name).write_text("fixture")
+            with patch.object(sys, "argv", ["iq_pack.py", "--gguf", str(first), "--out", str(out), "--compat-bf16"]), \
+                    patch.object(iq_pack.subprocess, "run", side_effect=tokenizer_export):
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(iq_pack.main(), 0)
             expert_index = (out / "native_experts.txt").read_text()
@@ -366,9 +400,14 @@ def run_pack(first, out, *extra):
     for n in ["vocab.json", "chat_template.jinja"]:
         (out / "tokenizer" / n).touch()
     buf = io.StringIO()
-    with patch.object(sys, "argv", ["iq_pack.py", "--gguf", str(first), "--out", str(out), *extra]):
-        with contextlib.redirect_stdout(buf):
-            rc = iq_pack.main()
+    args = iq_pack.argparse.Namespace(gguf=str(first), out=str(out), base=None,
+                                     compat_bf16="--compat-bf16" in extra,
+                                     experts_bin="--experts-bin" in extra,
+                                     skip_experts="--skip-experts" in extra)
+    # These upstream tests exercise the converter's in-place artifact safeguards.
+    # The CLI's stricter transactional publication is tested separately.
+    with contextlib.redirect_stdout(buf):
+        rc = iq_pack.build_pack(args)
     return rc, buf.getvalue()
 
 

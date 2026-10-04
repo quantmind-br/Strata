@@ -155,6 +155,13 @@ from the GGUF gave identical tokens and logits. An expert read from the GGUF is 
 engine fetches a layer's missing experts on 8 threads (`STRATA_FETCH_THREADS`) with one batched page request
 (Windows `PrefetchVirtualMemory`). With an `experts.bin` in the pack, nothing changes. Setup does not use this yet.
 
+**Creating native packs with `tools/iq_pack.py`:** choose a new `--out` directory. The CLI builds in a staging
+directory and publishes the complete pack atomically, with `PACK.json` recording source/converter identities
+and artifact hashes. Repeating the same conversion verifies and reuses an identical pack without rewriting it.
+An existing legacy pack without `PACK.json`, changed source/options/converter, or damaged artifacts is refused
+and left untouched; to regenerate, use a different `--out` and point the engine's `--pack` at that new directory.
+For example, adding `--experts-bin` to a previously published pack requires a new output directory too.
+
 **A RAM budget (engine 0.1.31, `--resident-budget-gib N`):** the resident variant for a model whose experts do not all
 fit: the N GiB of experts the GPU cache does not hold that the expert profile ranks hottest are copied into RAM at
 start (locked; page-locked when the driver allows the whole budget), and the rest are read from the files through the
