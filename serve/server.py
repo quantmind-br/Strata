@@ -1469,7 +1469,7 @@ class Service:
                 if self.fifo.acquire(timeout=0.1):
                     acquired = True
                     break
-            yield acquired
+            yield acquired and not cancel.is_set()
         finally:
             if acquired:
                 self.fifo.release()

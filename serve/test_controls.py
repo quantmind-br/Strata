@@ -108,6 +108,37 @@ class Controls(unittest.TestCase):
             self.assertEqual(svc.totals['requests'],0)
         finally:svc.fifo.release()
 
+    def test_cancel_during_successful_queue_acquire_does_not_load_engine(self):
+        tok = ByteTokenizer()
+
+        class Engine(MockEngine):
+            def alive(self):
+                return False
+
+            def restart(self):
+                raise AssertionError("cancelled queued request loaded the engine")
+
+        svc = Service(Engine(tok, 'hello'), tok, ChatTemplate(ROOT/'serve/chat_template.jinja'))
+        cancel = threading.Event()
+
+        class HandoffLock:
+            released = False
+
+            def acquire(self, timeout):
+                cancel.set()
+                return True
+
+            def release(self):
+                self.released = True
+
+        svc.fifo = HandoffLock()
+        result = list(svc.run([1], False, None, 100, {}, cancel))
+        self.assertEqual(result, [('done', {'finish': 'cancel', 'completion_tokens': 0, 'timings': None})])
+        self.assertTrue(svc.fifo.released)
+        self.assertEqual(svc.status['queued'], 0)
+        self.assertEqual(svc.totals['requests'], 0)
+
+
     def test_nonstream_disconnect_cancels(self):
         tok=ByteTokenizer(); engine=MockEngine(tok,'x'*2000,delay_s=.01)
         svc=Service(engine,tok,ChatTemplate(ROOT/'serve/chat_template.jinja'))
