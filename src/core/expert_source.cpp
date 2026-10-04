@@ -1,3 +1,4 @@
+#include "strata/platform/helper_affinity.hpp"
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
 #include "strata/core/remote_experts.hpp"
@@ -500,7 +501,7 @@ const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) cons
 bool FileExpertSource::pin_cache_complement(
     const ExpertCache& cache, std::string& err, bool pin,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
-    uint64_t headroom_bytes) {
+    uint64_t headroom_bytes, bool require_lent) {
     err.clear();
     if (base_ == nullptr) { err = "FileExpertSource: open the mapped experts before pinning a complement"; return false; }
     if (complement_ready_) { err = "FileExpertSource: the cache complement is already pinned"; return false; }
@@ -527,6 +528,7 @@ bool FileExpertSource::pin_cache_complement(
         for (int64_t expert = 0; expert < n_expert_; ++expert) {
             const int32_t slot = cache.slot_of(layer, expert);
             if (slot == kNotResident) continue;
+            if (require_lent && lend_from_slot >= 0 && slot >= lend_from_slot) continue;
             primary_gpu_pairs.emplace_back((int32_t) layer, (int32_t) expert);
             pair_slot.push_back(slot);
             if (slot >= 0 && slot < n_slots) slot_bytes[(size_t) slot] = layer_blob_bytes_[(size_t) layer];
@@ -537,7 +539,7 @@ bool FileExpertSource::pin_cache_complement(
     if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, primary_gpu_pairs,
                                             additional_gpu_pairs, offsets, bytes, err)) return false;
 
-    const bool lend = lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty();
+    const bool lend = !require_lent && lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty();
     uint64_t budget = std::numeric_limits<uint64_t>::max();
     if (bytes > 0 || lend) {
         uint64_t physical = 0;
@@ -696,7 +698,7 @@ bool FileExpertSource::pin_cache_complement(
     {
         const int threads = (int) std::max<int64_t>(1, std::min<int64_t>(6, n_layers_));
         std::vector<std::thread> pool;
-        for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
+        for (int i = 1; i < threads; ++i) pool.emplace_back([&] { strata::platform::apply_helper_affinity(); worker(); });
         worker();
         for (auto& t : pool) t.join();
     }
@@ -719,7 +721,7 @@ bool FileExpertSource::pin_cache_complement(
     complement_offsets_ = std::move(offsets);
     complement_pinned_ = pinned_ok && bytes > 0;
     complement_locked_ = locked;
-    complement_lent_slots_ = lend ? n_slots - keep_from : 0;
+    complement_lent_slots_ = require_lent && lend_from_slot >= 0 ? n_slots - lend_from_slot : lend ? n_slots - keep_from : 0;
     complement_ready_ = true;
     std::fprintf(stderr, "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB%s%s\n",
                  complement_pinned_ ? "mapped pinned" : pin ? "locked resident" : "pageable resident",

@@ -327,6 +327,14 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
                 args[pname] = json.loads(value)
             except ValueError:
                 args[pname] = value
+    for pname, value in args.items():
+        declared = (props.get(pname) or {}).get("type")
+        if isinstance(declared, str):
+            valid = {"string": isinstance(value, str), "integer": type(value) is int,
+                     "number": type(value) in (int, float), "boolean": type(value) is bool,
+                     "object": isinstance(value, dict), "array": isinstance(value, list), "null": value is None}
+            if declared in valid and not valid[declared]:
+                raise ValueError(f"tool {name}: parameter {pname} does not match declared type {declared}")
     return ToolCall(name=name, arguments=args)
 
 

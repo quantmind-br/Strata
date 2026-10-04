@@ -15,6 +15,7 @@ emoji (4-byte), combining marks, whitespace runs, and C0 control bytes.
 """
 from __future__ import annotations
 
+from functools import lru_cache
 import json
 import pathlib
 import sys
@@ -67,6 +68,7 @@ QWEN35_PATTERN = (
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
                  pre: str = "qwen35", special_ids: dict[str, int] | None = None):
+        self._cached_bpe = lru_cache(maxsize=16384)(lambda word: tuple(self._bpe(word)))
         self.tokens = tokens
         self.pre = pre
         self.token_types = token_types
@@ -159,7 +161,7 @@ class Tokenizer:
         out: list[int] = []
         for piece in self._re.findall(text):
             mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
-            for tok in self._bpe(mapped):
+            for tok in (self._cached_bpe(mapped) if len(mapped) <= 256 else self._bpe(mapped)):
                 i = self.ids.get(tok)
                 if i is None:
                     raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)

@@ -1,0 +1,406 @@
+{
+  "coder-dual": {
+    "short": {
+      "code": {
+        "decode_tps": 108.7,
+        "min_tps": 107.9,
+        "max_tps": 111.6,
+        "ttft_s": 0.4005987600030494,
+        "acceptance": 0.8475894245723172,
+        "completion_tokens": [
+          256,
+          256,
+          256
+        ]
+      },
+      "portuguese": {
+        "decode_tps": 70.4,
+        "min_tps": 64.3,
+        "max_tps": 76.6,
+        "ttft_s": 0.5081252769959974,
+        "acceptance": 0.521978021978022,
+        "completion_tokens": [
+          256,
+          256,
+          58
+        ]
+      },
+      "capitals": {
+        "decode_tps": 85.8,
+        "min_tps": 78.1,
+        "max_tps": 91.0,
+        "ttft_s": 0.3274473399942508,
+        "acceptance": 0.6585735963581184,
+        "completion_tokens": [
+          256,
+          256,
+          256
+        ]
+      },
+      "peak_gpu_gib": [
+        16.669921875,
+        18.421875
+      ],
+      "errors": 0
+    },
+    "context": {
+      "recall": 9,
+      "n": 9,
+      "4096": {
+        "prompt_n": 4010,
+        "prefill_tps": 1654.8,
+        "ttft_s": 2.4487966019951273,
+        "peak_gpu_gib": [
+          16.7060546875,
+          18.46875
+        ]
+      },
+      "16384": {
+        "prompt_n": 16299,
+        "prefill_tps": 2562.0,
+        "ttft_s": 6.430788448997191,
+        "peak_gpu_gib": [
+          16.716796875,
+          18.46875
+        ]
+      },
+      "28672": {
+        "prompt_n": 28577,
+        "prefill_tps": 3033.6,
+        "ttft_s": 9.495354445003613,
+        "peak_gpu_gib": [
+          16.716796875,
+          18.46875
+        ]
+      }
+    },
+    "quality": {
+      "passed": 10,
+      "n": 10,
+      "failed": []
+    }
+  },
+  "coder-single": {
+    "short": {
+      "code": {
+        "decode_tps": 95.8,
+        "min_tps": 95.6,
+        "max_tps": 99.1,
+        "ttft_s": 0.4207528840051964,
+        "acceptance": 0.8528951486697965,
+        "completion_tokens": [
+          256,
+          256,
+          256
+        ]
+      },
+      "portuguese": {
+        "decode_tps": 61.7,
+        "min_tps": 56.9,
+        "max_tps": 67.0,
+        "ttft_s": 0.5891706670008716,
+        "acceptance": 0.4973544973544973,
+        "completion_tokens": [
+          68,
+          256,
+          256
+        ]
+      },
+      "capitals": {
+        "decode_tps": 80.0,
+        "min_tps": 71.8,
+        "max_tps": 82.4,
+        "ttft_s": 0.3469920529969386,
+        "acceptance": 0.6529680365296804,
+        "completion_tokens": [
+          256,
+          256,
+          256
+        ]
+      },
+      "peak_gpu_gib": [
+        1.060546875,
+        22.443359375
+      ],
+      "errors": 0
+    },
+    "context": {
+      "recall": 9,
+      "n": 9,
+      "4096": {
+        "prompt_n": 4010,
+        "prefill_tps": 2007.4,
+        "ttft_s": 2.0230110909978976,
+        "peak_gpu_gib": [
+          1.060546875,
+          22.490234375
+        ]
+      },
+      "16384": {
+        "prompt_n": 16299,
+        "prefill_tps": 2339.5,
+        "ttft_s": 7.020222088001901,
+        "peak_gpu_gib": [
+          1.060546875,
+          22.490234375
+        ]
+      },
+      "28672": {
+        "prompt_n": 28577,
+        "prefill_tps": 2336.1,
+        "ttft_s": 12.310807194997324,
+        "peak_gpu_gib": [
+          1.060546875,
+          22.490234375
+        ]
+      }
+    },
+    "quality": null
+  },
+  "iq2-dual": {
+    "short": {
+      "code": {
+        "decode_tps": 131.5,
+        "min_tps": 131.0,
+        "max_tps": 134.6,
+        "ttft_s": 0.3203195589958341,
+        "acceptance": 0.8535825545171339,
+        "completion_tokens": [
+          256,
+          256,
+          256
+        ]
+      },
+      "portuguese": {
+        "decode_tps": 80.1,
+        "min_tps": 77.6,
+        "max_tps": 81.0,
+        "ttft_s": 0.4066517129977001,
+        "acceptance": 0.42452830188679247,
+        "completion_tokens": [
+          256,
+          256,
+          256
+        ]
+      },
+      "capitals": {
+        "decode_tps": 97.4,
+        "min_tps": 92.6,
+        "max_tps": 101.7,
+        "ttft_s": 0.25224753899965435,
+        "acceptance": 0.593006993006993,
+        "completion_tokens": [
+          256,
+          256,
+          256
+        ]
+      },
+      "peak_gpu_gib": [
+        21.1044921875,
+        21.99609375
+      ],
+      "errors": 0
+    },
+    "context": {
+      "recall": 9,
+      "n": 9,
+      "4096": {
+        "prompt_n": 4010,
+        "prefill_tps": 1430.6,
+        "ttft_s": 2.8328508050035452,
+        "peak_gpu_gib": [
+          21.1533203125,
+          22.037109375
+        ]
+      },
+      "16384": {
+        "prompt_n": 16299,
+        "prefill_tps": 2230.4,
+        "ttft_s": 7.371115330999601,
+        "peak_gpu_gib": [
+          21.1533203125,
+          22.037109375
+        ]
+      },
+      "28672": {
+        "prompt_n": 28577,
+        "prefill_tps": 2783.2,
+        "ttft_s": 10.338206435997563,
+        "peak_gpu_gib": [
+          21.1533203125,
+          22.037109375
+        ]
+      }
+    },
+    "quality": null
+  },
+  "iq2-tuned": {
+    "short": {
+      "code": {
+        "decode_tps": 135.5,
+        "min_tps": 133.4,
+        "max_tps": 137.9,
+        "ttft_s": 0.3260473179980181,
+        "acceptance": 0.9313893653516295,
+        "completion_tokens": [
+          256,
+          256,
+          256
+        ]
+      },
+      "portuguese": {
+        "decode_tps": 83.9,
+        "min_tps": 80.1,
+        "max_tps": 84.0,
+        "ttft_s": 0.4018988140014699,
+        "acceptance": 0.5476190476190477,
+        "completion_tokens": [
+          256,
+          256,
+          256
+        ]
+      },
+      "capitals": {
+        "decode_tps": 98.2,
+        "min_tps": 96.4,
+        "max_tps": 105.1,
+        "ttft_s": 0.2519611440002336,
+        "acceptance": 0.6817420435510888,
+        "completion_tokens": [
+          256,
+          256,
+          256
+        ]
+      },
+      "peak_gpu_gib": [
+        21.1044921875,
+        21.99609375
+      ],
+      "errors": 0
+    },
+    "context": {
+      "recall": 9,
+      "n": 9,
+      "4096": {
+        "prompt_n": 4010,
+        "prefill_tps": 1524.7,
+        "ttft_s": 2.654099048995704,
+        "peak_gpu_gib": [
+          21.1533203125,
+          22.037109375
+        ]
+      },
+      "16384": {
+        "prompt_n": 16299,
+        "prefill_tps": 2210.6,
+        "ttft_s": 7.426380386998062,
+        "peak_gpu_gib": [
+          21.1533203125,
+          22.037109375
+        ]
+      },
+      "28672": {
+        "prompt_n": 28577,
+        "prefill_tps": 2784.6,
+        "ttft_s": 10.36368725200009,
+        "peak_gpu_gib": [
+          21.1533203125,
+          22.037109375
+        ]
+      }
+    },
+    "quality": {
+      "passed": 10,
+      "n": 10,
+      "failed": []
+    }
+  },
+  "q2-dual": {
+    "short": {
+      "code": {
+        "decode_tps": 144.6,
+        "min_tps": 143.0,
+        "max_tps": 146.5,
+        "ttft_s": 0.2816472589984187,
+        "acceptance": 0.895330112721417,
+        "completion_tokens": [
+          256,
+          256,
+          256
+        ]
+      },
+      "portuguese": {
+        "decode_tps": 78.2,
+        "min_tps": 76.9,
+        "max_tps": 83.6,
+        "ttft_s": 0.3628383949981071,
+        "acceptance": 0.3903061224489796,
+        "completion_tokens": [
+          256,
+          256,
+          256
+        ]
+      },
+      "capitals": {
+        "decode_tps": 105.4,
+        "min_tps": 98.3,
+        "max_tps": 111.8,
+        "ttft_s": 0.22560908200102858,
+        "acceptance": 0.6520423600605144,
+        "completion_tokens": [
+          256,
+          256,
+          256
+        ]
+      },
+      "peak_gpu_gib": [
+        21.1318359375,
+        21.498046875
+      ],
+      "errors": 0
+    },
+    "context": {
+      "recall": 9,
+      "n": 9,
+      "4096": {
+        "prompt_n": 4010,
+        "prefill_tps": 1574.1,
+        "ttft_s": 2.571891333995154,
+        "peak_gpu_gib": [
+          21.1767578125,
+          21.544921875
+        ]
+      },
+      "16384": {
+        "prompt_n": 16299,
+        "prefill_tps": 2458.8,
+        "ttft_s": 6.679507818000275,
+        "peak_gpu_gib": [
+          21.1953125,
+          21.546875
+        ]
+      },
+      "28672": {
+        "prompt_n": 28577,
+        "prefill_tps": 2871.9,
+        "ttft_s": 10.02297011599876,
+        "peak_gpu_gib": [
+          21.18359375,
+          21.546875
+        ]
+      }
+    },
+    "quality": {
+      "passed": 9,
+      "n": 10,
+      "failed": [
+        "HumanEval/106"
+      ]
+    }
+  },
+  "q2-tuned": {
+    "short": null,
+    "context": null,
+    "quality": null
+  }
+}

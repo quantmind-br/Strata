@@ -333,17 +333,17 @@ class SamplingKeys(unittest.TestCase):
     def test_top_k(self):
         self.assertIn("top_k=10", self.keys(temperature=0.7, top_k=10))
         self.assertIn("top_k=64", self.keys(temperature=0.7, top_k=64))
-        self.assertIn("top_k=64", self.keys(temperature=0.7, top_k=0))
-        self.assertIn("top_k=64", self.keys(temperature=0.7, top_k=100))
-        for bad in (-1, True, 2.5, "20"):
-            self.assertFalse([k for k in self.keys(temperature=0.7, top_k=bad) if k.startswith("top_k=")], bad)
+        for bad in (0, 100, -1, True, 2.5, "20"):
+            with self.assertRaises(ValueError):
+                self.keys(temperature=0.7, top_k=bad)
 
     def test_tune_keys(self):
         k = self.keys(temperature=0, strata_tune={"pcie_frac": 0.2, "spec_min_p": 0.7})
         self.assertIn("pcie_frac=0.2", k)
         self.assertIn("spec_min_p=0.7", k)
-        bad = self.keys(strata_tune={"pcie_frac": 3, "spec_min_p": True, "pool_workers": 2})
-        self.assertFalse([x for x in bad if x.split("=")[0] in ("pcie_frac", "spec_min_p", "pool_workers")])
+        with self.assertRaises(ValueError):
+            self.keys(strata_tune={"pcie_frac": 3, "spec_min_p": True, "pool_workers": 2})
+
 
     def test_penalty_window(self):
         self.assertIn("penalty_last_n=64", self.keys(presence_penalty=1.5))
@@ -1098,10 +1098,10 @@ class RequestFinalization(unittest.TestCase):
                         self.lock = threading.Lock()
                         self.once = True
 
-                    def __enter__(self):
-                        self.lock.acquire()
+                    def acquire(self, timeout=None):
+                        return self.lock.acquire(timeout=timeout)
 
-                    def __exit__(self, *args):
+                    def release(self):
                         self.lock.release()
                         if self.once:
                             self.once = False
@@ -1144,11 +1144,12 @@ class RequestFinalization(unittest.TestCase):
         svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
 
         class QueueLock:
-            def __enter__(self):
+            def acquire(self, timeout=None):
                 # The previous request finishes while this request waits to acquire FIFO.
                 engine.last = {"generated": 8, "decode_ms": 80}
+                return True
 
-            def __exit__(self, *args):
+            def release(self):
                 pass
 
         svc.fifo = QueueLock()

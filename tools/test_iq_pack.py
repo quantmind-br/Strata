@@ -29,6 +29,34 @@ def write_gguf(path, tensors):
 
 
 class CompatibilityTests(unittest.TestCase):
+    def test_native_ple_key_preserves_quantized_payload(self):
+        for kind, block_bytes in [(Q.IQ3_XXS, 98), (Q.IQ4_XS, 136)]:
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / "key.gguf"
+                # Valid quantized block storage, with normal fp16 scales. This
+                # is input payload, not a re-quantization or BF16 conversion.
+                raw = np.arange(2 * block_bytes, dtype=np.uint8).reshape(2, block_bytes)
+                raw[:, :2] = np.frombuffer(np.float16(0.01).tobytes(), dtype=np.uint8)
+                writer = GGUFWriter(source, "qwen4exp")
+                writer.add_tensor("blk.1.ple_key.weight", raw, raw_dtype=kind)
+                writer.write_header_to_file()
+                writer.write_kv_data_to_file()
+                writer.write_tensors_to_file()
+                writer.close()
+                original = source.read_bytes()
+                model = iq_pack.Model(source)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(iq_pack.index_standalone(source, root, model, True), 0)
+                _, rows = iq_pack.read_index(root / "index.txt")
+                row = rows["blk.1.ple_key.weight"]
+                self.assertEqual(row[2], "0")  # served from native GGUF
+                self.assertEqual(row[7:9], ["256", "2"])
+                self.assertEqual((root / "dense.bin").stat().st_size, 0)
+                self.assertEqual(json.loads((root / "compat-bf16.json").read_text())["tensors"], [])
+                self.assertEqual(model.bytes("blk.1.ple_key.weight").tobytes(), raw.tobytes())
+                self.assertEqual(source.read_bytes(), original)
+
     def test_bf16_halfway_rounds_to_even(self):
         values = np.array([0x3F808000, 0x3F818000, 0xBF808000, 0xBF818000], dtype=np.uint32)
         got = np.frombuffer(iq_pack.bf16_bytes(values.view(np.uint8), "F32"), dtype=np.uint16)
@@ -132,10 +160,13 @@ class CompatibilityTests(unittest.TestCase):
                 iq_pack.Model(first)
             second.symlink_to(root / "blob2")
             out = root / "pack"
-            (out / "tokenizer").mkdir(parents=True)
-            for name in ["vocab.json", "chat_template.jinja"]:
-                (out / "tokenizer" / name).touch()
-            with patch.object(sys, "argv", ["iq_pack.py", "--gguf", str(first), "--out", str(out), "--compat-bf16"]):
+            def tokenizer_export(cmd, **kwargs):
+                target = Path(cmd[cmd.index("--out") + 1]) / "tokenizer"
+                target.mkdir(parents=True)
+                for name in ["vocab.json", "chat_template.jinja"]:
+                    (target / name).write_text("fixture")
+            with patch.object(sys, "argv", ["iq_pack.py", "--gguf", str(first), "--out", str(out), "--compat-bf16"]), \
+                    patch.object(iq_pack.subprocess, "run", side_effect=tokenizer_export):
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(iq_pack.main(), 0)
             expert_index = (out / "native_experts.txt").read_text()

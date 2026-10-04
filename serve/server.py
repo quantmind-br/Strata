@@ -30,6 +30,9 @@ import ctypes
 import json
 import os
 import queue
+import select
+import socket
+from contextlib import contextmanager
 import signal
 import subprocess
 import sys
@@ -48,6 +51,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             images_of, openai_to_messages)
+from serve.controls import (RequestError, StopFilter, stop_sequences, tool_policy, validate_request,  # noqa: E402
+                            validate_sampling)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 
@@ -164,6 +169,7 @@ class StrataEngine:
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None):
+        self.starting = True
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
@@ -206,13 +212,18 @@ class StrataEngine:
             self.info["version"] = str(self.info["engine"])
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
-        threading.Thread(target=self._pump, daemon=True).start()
+        self.pump = threading.Thread(target=self._pump, args=(self.proc, self.lines), daemon=True)
+        self.pump.start()
+        self.starting = False
 
-    def _pump(self):
-        for line in self.proc.stdout:
-            self.lines.put(line)
-        self.ended = True                               # its output closed: it is gone, even before the OS says so
-        self.lines.put(None)
+    def _pump(self, proc, lines):
+        try:
+            for line in proc.stdout:
+                lines.put(line)
+        finally:
+            if proc is self.proc:
+                self.ended = True
+            lines.put(None)
 
     def death_note(self) -> str:
         """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
@@ -238,7 +249,7 @@ class StrataEngine:
                 "smaller model (Q2_0 / IQ2_XS).")
 
     def alive(self) -> bool:
-        return not getattr(self, "ended", False) and self.proc.poll() is None
+        return not getattr(self, "starting", False) and not getattr(self, "ended", False) and self.proc.poll() is None
 
     def exit_code(self):
         try:
@@ -267,10 +278,7 @@ class StrataEngine:
 
     def restart(self):
         """Start the engine again (the same command) after it died; the new process has its own line queue."""
-        try:
-            self.proc.kill()
-        except OSError:
-            pass
+        self._terminate()
         info = dict(self.info)
         self.ended = False
         self.__init__(*self.spawn)
@@ -287,6 +295,7 @@ class StrataEngine:
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
+        validate_sampling(sampling)
         keys = ""
         t = sampling.get("temperature")
         if isinstance(t, (int, float)) and float(t) > 0.0:
@@ -321,7 +330,7 @@ class StrataEngine:
             else:
                 keys += " penalty_last_n=64"
         seed = sampling.get("seed")
-        if isinstance(seed, int) and seed > 0:
+        if type(seed) is int and seed >= 0:
             keys += f" seed={seed}"
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
@@ -357,7 +366,7 @@ class StrataEngine:
         try:
             while True:
                 try:
-                    line = self.lines.get(timeout=10)
+                    line = self.lines.get(timeout=0.25)
                 except queue.Empty:
                     if cancel.is_set():
                         return
@@ -393,21 +402,48 @@ class StrataEngine:
                         self.proc.stdin.flush()
                     except OSError:
                         pass
-                while True:
-                    line = self.lines.get()
+                deadline = time.monotonic() + 10.0
+                while time.monotonic() < deadline:
+                    try:
+                        line = self.lines.get(timeout=min(0.25, max(0.001, deadline - time.monotonic())))
+                    except queue.Empty:
+                        continue
                     if line is None or line.startswith("ERR"):
                         break
                     if line.startswith("DONE"):
                         self._parse_done(line)
                         break
+                else:
+                    self._terminate()
+
+    def _terminate(self):
+        """Reap the old child before another request may acquire its resources."""
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+        else:
+            self.proc.wait()
+        if hasattr(self, "pump"):
+            self.pump.join(timeout=2)
+        for pipe in (self.proc.stdin, self.proc.stdout):
+            if pipe:
+                pipe.close()
+        if hasattr(self.log, "close"):
+            self.log.close()
+        self.ended = True
+
 
     def close(self):
         try:
             self.proc.stdin.write("QUIT\n")
             self.proc.stdin.flush()
             self.proc.wait(timeout=10)
-        except Exception:
-            self.proc.kill()
+        finally:
+            self._terminate()
 
 
 class Vision:
@@ -536,6 +572,36 @@ def gpu_list(cfg: dict) -> list[int]:
         return []
     items = g if isinstance(g, (list, tuple)) else str(g).split(",")
     return [int(str(x).strip()) for x in items if str(x).strip() != ""]
+
+
+def managed_config(cfg: dict, model: str | None, max_context: int | None) -> dict:
+    """Validate a launcher's model against the prepared pack and apply its context.
+
+    Never substitute the native model: pack, PLE weights and tokenizer must match
+    it. Return a copy so CLI overrides do not rewrite the setup/shared settings.
+    """
+    args = list(cfg.get("args", []))
+    if model is not None:
+        native = [i for i, value in enumerate(args) if value == "--native"]
+        if len(native) != 1 or native[0] + 1 >= len(args):
+            raise ValueError("--model requires exactly one --native model in the config")
+        path = Path(args[native[0] + 1])
+        if not path.is_absolute():
+            path = Path(cfg.get("cwd") or Path.cwd()) / path
+        if path.resolve() != Path(model).resolve():
+            raise ValueError("--model does not match the config's --native model; select its matching prepared config")
+    if max_context is not None:
+        if max_context < 1:
+            raise ValueError("--max-context must be positive")
+        # Native options use separate tokens. Remove all prior occurrences so
+        # the engine and HTTP budget cannot disagree about which value wins.
+        indices = [i for i, value in enumerate(args) if value == "--max-context"]
+        for i in reversed(indices):
+            if i + 1 >= len(args) or args[i + 1].startswith("--"):
+                raise ValueError("--max-context in the config is missing its value")
+            del args[i:i + 2]
+        args += ["--max-context", str(max_context)]
+    return {**cfg, "args": args}
 
 
 def engine_args(cfg: dict) -> list[str]:
@@ -886,10 +952,10 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
-    def prepare(self, messages, tools, kwargs, max_new=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, prefix=""):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
-        the rest of the context."""
-        prompt = self.template.render(messages, tools=tools, **kwargs)
+        the rest of the context.  `prefix`: the start of the answer a forced tool choice writes (controls.tool_policy)."""
+        prompt = self.template.render(messages, tools=tools, **kwargs) + prefix
         ids = self.tok.encode(prompt, parse_special=True)
         self.embeddings.path = None
         images = images_of(messages)
@@ -975,13 +1041,35 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
-    def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
-        """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
+    @contextmanager
+    def _request_lock(self, cancel):
+        acquired = False
+        try:
+            while not cancel.is_set():
+                if self.fifo.acquire(timeout=0.1):
+                    acquired = True
+                    break
+            yield acquired
+        finally:
+            if acquired:
+                self.fifo.release()
+
+    def run(self, ids, thinking, tools, max_new, sampling, cancel, prefix="", max_calls=None) -> Iterator[tuple[str, object]]:
+        """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
+        `prefix`: the forced start of the answer, already at the end of `ids` - parsed as if generated, and the
+        answer must then complete a call to an offered tool (else ValueError, never plain text).  `max_calls`:
+        generation stops after that many complete calls, and nothing written after them is returned."""
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        validate_sampling(sampling or {})
+        stopper = StopFilter(stop_sequences(sampling or {}))
+        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=False)
+        if prefix:
+            parser.feed(prefix)                         # a call's opening: no event until the call completes
+        offered = {t.get("name") for t in tools or []}
+        calls, limited, refused = 0, False, None
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
@@ -989,7 +1077,14 @@ class Service:
         with self.status_lock:
             self.status["queued"] += 1
         # #266: status and metrics belong to the same critical section as engine generation.
-        with self.fifo:
+        with self._request_lock(cancel) as acquired:
+            if not acquired:
+                with self.status_lock:
+                    self.status["queued"] -= 1
+                if emb:
+                    Path(emb).unlink(missing_ok=True)
+                yield "done", {"finish": "cancel", "completion_tokens": 0, "timings": None}
+                return
             # Capture after waiting: an earlier request may have replaced engine.last while we queued.
             engine_last0 = getattr(self.engine, "last", None)
             try:
@@ -1018,11 +1113,25 @@ class Service:
                             raw_ids.append(t)
                             break
                         raw_ids.append(t)
-                        evs = parser.feed(detok.push(t))
+                        evs = parser.feed(stopper.feed(detok.push(t)))
                         self._note(n, evs)
                         last_print = self._progress(last_print)
                         for ev in evs:
+                            if ev.kind == "tool_call" and prefix and ev.call.name not in offered:
+                                refused = f"the forced tool call named {ev.call.name!r}, which the request does not offer"
+                                break
+                            if ev.kind == "tool_call":
+                                calls += 1
                             yield "event", ev
+                            if max_calls and calls >= max_calls:
+                                limited = True          # the rest of the answer is dropped, not returned
+                                break
+                        if refused:
+                            finish = "error"
+                            break
+                        if limited or stopper.matched is not None:
+                            finish = "stop"
+                            break
                     if cancel.is_set():
                         finish = "cancel"
                 except EngineDied as e:
@@ -1074,6 +1183,9 @@ class Service:
                         fresh = getattr(self.engine, "last", None)
                         if fresh is not None and fresh is not before:      # the engine's clock for THIS request
                             timings = request_timings(len(ids), n, last)
+                            if timings:
+                                timings["effective_settings"] = {k: sampling[k] for k in ("seed", "temperature", "top_k", "top_p", "min_p", "reasoning_effort", "strata_tune") if k in (sampling or {})}
+                                timings["engine_info"] = dict(getattr(self.engine, "info", {}) or {})
                             self.last_timings = dict(timings, at=int(time.time())) if timings else None
                         self.last_request_at = time.time()
                         now = time.time()
@@ -1088,8 +1200,16 @@ class Service:
                     self.status["busy"] = False
                     self.status.pop("tail", None)            # #212: the answer's end is not kept once it is done
                     self.status.pop("tool", None)
-        for ev in parser.finish():
-            yield "event", ev
+        if refused:
+            raise ValueError(refused)
+        if not cancel.is_set() and not limited:
+            tail = parser.feed(stopper.finish()) + parser.finish()
+            if prefix and not calls and not any(ev.kind == "tool_call" for ev in tail):
+                raise ValueError(f"the forced tool call did not complete ({finish}); no answer is returned")
+            for ev in tail:
+                if ev.kind == "tool_call" and prefix and ev.call.name not in offered:
+                    raise ValueError(f"the forced tool call named {ev.call.name!r}, which the request does not offer")
+                yield "event", ev
         yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
                        "timings": timings}
 
@@ -1155,6 +1275,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                     if ev.kind == "tool_start":          # the model has started writing a call: say so at once
                         yield "mcp", {"event": "start", "id": ev.call.id, "name": ev.call.name}
                     elif ev.kind == "tool_call":
+                        yield "mcp", {"event": "start", "id": ev.call.id, "name": ev.call.name}
                         calls.append(ev.call)
                     continue                             # its argument pieces are not streamed to the client
                 if ev.kind == "tool_call":
@@ -1218,7 +1339,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
 
 
 # ------------------------------------------------------------------------------------------------ OpenAI
-def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None):
+def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, policy=("", None)):
     """`run`: the events to send instead of Service.run's (run_with_mcp); its ("mcp", {...}) items become chunks with
     an empty delta and a `strata_mcp` field, which only the web app reads."""
     cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
@@ -1230,7 +1351,7 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     yield chunk({"role": "assistant", "content": ""})
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
-    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel):
+    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel, *policy):
         if kind == "ping":
             yield None
         elif kind == "mcp":
@@ -1305,7 +1426,7 @@ def openai_collect(chunks) -> dict:
 
 
 # ------------------------------------------------------------------------------------------------ Anthropic
-def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel):
+def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, policy=("", None)):
     mid = "msg_" + uuid.uuid4().hex[:24]
     yield "message_start", {"type": "message_start", "message": {
         "id": mid, "type": "message", "role": "assistant", "model": svc.model, "content": [],
@@ -1316,7 +1437,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         return ("content_block_stop", {"type": "content_block_stop", "index": index})
 
     streamed = set()
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
+    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, *policy):
         if kind == "ping":
             yield None
             continue
@@ -1481,7 +1602,9 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
             elif path == "/health":
-                self._json(200, {"status": "ok", "max_context": svc.engine.max_context, "model": svc.model,
+                loaded = svc.loaded()
+                state = "restarting" if getattr(svc.engine, "starting", False) else "ready" if loaded else "unloaded" if getattr(svc.engine, "unloaded", False) else "failed"
+                self._json(503 if state in ("failed", "restarting") else 200, {"status": state, "max_context": svc.engine.max_context, "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "loaded": svc.loaded()})
             elif path == "/status":
@@ -1546,7 +1669,8 @@ def make_handler(svc: Service):
             try:
                 req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
                 if path in ("/v1/chat/completions", "/v1/messages"):
-                    svc.load()                               # unloaded: load first (or 503 while the GPU is busy)
+                    validate_request(req, "openai" if path.endswith("completions") else "anthropic")
+                    validate_sampling({**svc.sampling_defaults, **svc.shared, **{k: v for k, v in req.items() if v is not None}})
                 if path == "/v1/chat/completions":
                     self._openai(req)
                 elif path == "/v1/messages":
@@ -1554,7 +1678,7 @@ def make_handler(svc: Service):
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except ValueError as e:
-                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e), "param": getattr(e, "param", None)}})
             except GpuBusy as e:
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
             except EngineDied as e:                          # before the answer started (not streamed)
@@ -1606,7 +1730,7 @@ def make_handler(svc: Service):
                 req = json.loads(body or b"{}")
                 shared = svc.set_shared(req.get("defaults") if isinstance(req, dict) else None)
             except ValueError as e:
-                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e), "param": getattr(e, "param", None)}})
                 return
             print("[strata] other apps now use the Chat settings: " + ", ".join(f"{k}={v}" for k, v in shared.items())
                   if shared else "[strata] other apps use their own settings again", flush=True)
@@ -1617,6 +1741,29 @@ def make_handler(svc: Service):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
+
+        def _collect(self, events, collector, cancel):
+            finished = threading.Event()
+            def watch():
+                while not finished.wait(0.1):
+                    try:
+                        readable, _, _ = select.select([self.connection], [], [], 0)
+                        if readable and not self.connection.recv(1, socket.MSG_PEEK):
+                            cancel.set()
+                            return
+                    except OSError:
+                        cancel.set()
+                        return
+            watcher = threading.Thread(target=watch, daemon=True)
+            watcher.start()
+            try:
+                result = collector(events)
+                if not cancel.is_set():
+                    self._json(200, result)
+            finally:
+                finished.set()
+                watcher.join(timeout=1)
+                events.close()
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
@@ -1631,14 +1778,17 @@ def make_handler(svc: Service):
                 extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            policy = tool_policy(req, "openai")
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, policy[0])
+            if policy[0] and thinking:
+                raise RequestError("tool_choice", "forcing a tool call needs thinking off (reasoning_effort none)")
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run)
+            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, policy=policy)
             if not req.get("stream"):
-                return self._json(200, openai_collect(chunks))
+                return self._collect(chunks, openai_collect, cancel)
             self._sse()
             try:
                 for c in chunks:
@@ -1662,12 +1812,15 @@ def make_handler(svc: Service):
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req)
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            policy = tool_policy(req, "anthropic")
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, policy[0])
+            if policy[0] and thinking:
+                raise RequestError("tool_choice", "forcing a tool call needs thinking off (thinking disabled)")
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
-            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
+            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, policy)
             if not req.get("stream"):
-                return self._json(200, anthropic_collect(events))
+                return self._collect(events, anthropic_collect, cancel)
             self._sse()
             try:
                 for item in events:
@@ -1702,23 +1855,20 @@ class Server(ThreadingHTTPServer):
 
 
 def warn_tight_ram(arena_mib) -> None:
-    """The model's experts live in RAM (INFO arena_mib, engine 0.1.10+).  With less than ~6 GB left beside them for the
-    system, the engine and this server, Linux ends the engine mid-answer when memory runs out (issue #27) and Windows
-    pages to disk; say so at start instead of after a lost answer."""
-    if not isinstance(arena_mib, int) or arena_mib <= 0:
-        return
+    """Check live working-set headroom, including mmap/resident complements."""
     try:
-        import psutil
-        total = psutil.virtual_memory().total
-    except Exception:  # noqa: BLE001 - psutil is optional here
+        if os.name != "nt":
+            fields = {line.split(':', 1)[0]: int(line.split()[1]) for line in
+                      Path('/proc/meminfo').read_text().splitlines() if ':' in line}
+            available = fields['MemAvailable'] / 1024**2
+        else:
+            import psutil
+            available = psutil.virtual_memory().available / 2**30
+    except (OSError, ValueError, KeyError, ImportError):
         return
-    left = total / 2**30 - arena_mib / 1024
-    if left < 6:
-        print(f"[strata] WARNING: RAM is tight - the model's experts take {arena_mib / 1024:.1f} GB of this PC's "
-              f"{total / 2**30:.0f} GB, leaving {left:.1f} GB for everything else. "
-              + ("Linux may stop the engine in the middle of an answer. " if os.name != "nt" else
-                 "Windows will slow down (paging to disk). ")
-              + "Close other programs, or run START-HERE --setup and pick a smaller size (Q2_0 / IQ2_XS).", flush=True)
+    if available < 6:
+        print(f"[strata] WARNING: working-set headroom is {available:.1f} GiB; "
+              f"arena_mib={arena_mib} excludes mmap file cache and resident complements.", flush=True)
 
 
 def lan_addresses() -> list[str]:
@@ -1760,7 +1910,7 @@ def clean_shared_defaults(d) -> dict:
     for key, value in d.items():
         if value is None or value == "":
             continue
-        number = isinstance(value, (int, float)) and not isinstance(value, bool)
+        number = isinstance(value, (int, float)) and not isinstance(value, bool) and __import__("math").isfinite(value)
         if key == "reasoning_effort":
             if value not in ("none", "low", "medium", "high"):
                 raise ValueError("reasoning_effort: none, low, medium or high")
@@ -1775,7 +1925,7 @@ def clean_shared_defaults(d) -> dict:
                 raise ValueError("top_k: an integer 1..64")
             value = int(value)
         elif key in ("seed", "max_tokens"):
-            if not number or value != int(value) or value <= 0:
+            if not number or not isinstance(value, int) or value < (0 if key == "seed" else 1):
                 raise ValueError(f"{key}: a positive integer")
             value = int(value)
         elif key == "experimental_speed_projection":
@@ -1798,7 +1948,7 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     for key, value in (cfg.get("sampling") or {}).items():
         if value is None:
             continue
-        number = isinstance(value, (int, float)) and not isinstance(value, bool)
+        number = isinstance(value, (int, float)) and not isinstance(value, bool) and __import__("math").isfinite(value)
         if key == "temperature":
             if not number or value < 0:
                 raise SystemExit(f"[strata] config sampling.temperature={value!r}: expected a number >= 0 (0 = greedy)")
@@ -1832,7 +1982,7 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
                 raise SystemExit(f"[strata] config sampling.penalty_last_n={value!r}: expected a non-negative integer")
             out[key] = int(value)
         elif key == "seed":
-            if not number or value != int(value) or value <= 0:
+            if not number or not isinstance(value, int) or not 0 <= value <= 2**64-1:
                 raise SystemExit(f"[strata] config sampling.seed={value!r}: expected a positive integer")
             out[key] = int(value)
         elif key == "experimental_speed_projection":
@@ -1850,6 +2000,8 @@ def main() -> int:
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
                                      "written by setup.py")
+    ap.add_argument("--model", help="verify this native GGUF matches --native in the prepared config (managed launchers)")
+    ap.add_argument("--max-context", type=int, help="override the engine context in tokens; omit to use the config")
     ap.add_argument("--host", default=None,
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other devices "
                          "on your network (set an API key); also \"host\" in the config")
@@ -1881,6 +2033,13 @@ def main() -> int:
                                           "server's model; also \"before_load\" in the config, a string or a list)")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    if a.model is not None or a.max_context is not None:
+        if a.engine != "strata" or not a.config:
+            ap.error("--model and --max-context require --engine strata and --config")
+        try:
+            cfg = managed_config(cfg, a.model, a.max_context)
+        except ValueError as exc:
+            ap.error(str(exc))
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can

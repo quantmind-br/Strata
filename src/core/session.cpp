@@ -1,3 +1,4 @@
+#include "strata/platform/helper_affinity.hpp"
 // src/core/session.cpp - one token through all 48 layers.  See the header for why the graphs are per-layer.
 #include "strata/core/session.hpp"
 #include "strata/core/progress.hpp"
@@ -537,6 +538,7 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string& err) {
     // for a property that wants to hold for the whole session.
     const std::vector<int> cores = strata::kernels::cpu::physical_cores(false);
     if (!cores.empty()) {
+        strata::platform::capture_helper_affinity(cores[0]);
         pinned_core = strata::kernels::cpu::pin_current_thread(cores[0]);
         pinned = true;
     }

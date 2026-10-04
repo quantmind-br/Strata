@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import collections
 import ctypes
+from pathlib import Path
 import os
 import platform
 import sys
@@ -113,7 +114,7 @@ def _cpu_name():
         except OSError:
             pass
     elif os.path.exists("/proc/cpuinfo"):
-        for line in open("/proc/cpuinfo", encoding="utf-8", errors="replace"):
+        for line in Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="replace").splitlines():
             if line.startswith("model name"):
                 return line.split(":", 1)[1].strip()
     return platform.processor() or None
@@ -132,7 +133,7 @@ class _CpuRamFallback:
                 return idle.value, kern.value + user.value           # kernel time includes idle
             return None
         try:
-            f = [int(x) for x in open("/proc/stat").readline().split()[1:]]
+            f = [int(x) for x in Path("/proc/stat").read_text().splitlines()[0].split()[1:]]
             return f[3] + f[4], sum(f)
         except (OSError, ValueError):
             return None

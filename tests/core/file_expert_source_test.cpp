@@ -1,4 +1,7 @@
 #include "strata/core/expert_source.hpp"
+#include "strata/core/expert_cache.hpp"
+#include "strata/platform/helper_affinity.hpp"
+#include <cuda_runtime.h>
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
@@ -288,14 +291,96 @@ void test_cgroup_memory_budget() {
             "missing memory.stat counters did not fail closed");
 }
 
+void test_dual_resident_loans_and_exchanges() {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    TempDirectory dir;
+    std::string err;
+    require(expert_layout_load(dir.path.string(), 2, 3, err), err);
+    create_pack(dir.path, 6ull * BLOB,
+                {{0, 'a'}, {BLOB, 'b'}, {2ull*BLOB, 'c'}, {3ull*BLOB, 'd'}, {4ull*BLOB, 'e'}, {5ull*BLOB, 'f'}});
+    FileExpertSource source;
+    require(source.open(dir.path.string(), 2, 3, err), err);
+    ExpertCache first, second;
+    for (int device = 0; device < 2; ++device) {
+        require(cudaSetDevice(device) == cudaSuccess, "set device");
+        auto& cache = device ? second : first;
+        require(cache.open(2, 2, 3, BLOB, err), err);
+        for (int e = 0; e < 2; ++e) {
+            const int slot = cache.admit(device, e);
+            require(slot == e, "slot ownership");
+            require(cache.fill_slot_blocking(slot, source.blob(device, e), err), err);
+        }
+    }
+    require(cudaSetDevice(0) == cudaSuccess, "restore device");
+    // The second GPU contributes only its non-lent slot. Both lent experts MUST
+    // remain in the host complement, along with the ordinary misses.
+    require(!source.pin_cache_complement(first, err, false, {{1,0}}, 1,
+                std::numeric_limits<uint64_t>::max(), true), "unsafe budget accepted");
+    require(!source.complement_ready() && source.resident_bytes() == 0, "failed plan retained ownership");
+    require(source.reserve_exchanges(2, err), err);
+    require(source.pin_cache_complement(first, err, false, {{1,0}}, 1, 0, true), err);
+    require(source.resident_bytes() == 4ull*BLOB, "dual union duplicated or omitted loan bytes");
+    for (int layer = 0; layer < 2; ++layer) {
+        require(!source.has_resident(layer, 0), "non-lent GPU expert duplicated");
+        require(source.has_resident(layer, 1) && source.has_resident(layer, 2), "missing loan/miss");
+        require(cudaSetDevice(layer) == cudaSuccess, "set refill owner");
+        auto& cache = layer ? second : first;
+        const auto* lent = source.blob(layer, 1);
+        require(lent[0] == (layer ? 'e' : 'b'), "wrong loan bytes");
+        require(cudaMemset(cache.device_slot(1), 0, BLOB) == cudaSuccess, "borrow slot");
+        require(cache.fill_slot_blocking(1, lent, err) && cache.verify_slot(1, lent, err), err);
+        const auto q = source.staged_exchanges();
+        require(q == layer, "cross-stage exchange index reused");
+        require(cudaMemcpy(source.exchange_buffer(q), cache.device_slot(0), BLOB, cudaMemcpyDeviceToHost) == cudaSuccess,
+                "copy evicted bytes from owning device");
+        require(source.stage_exchange(layer, 2, 0, q), "stage exchange");
+    }
+    require(source.commit_exchanges() == 2, "not all stages committed");
+    require(source.blob(0,0)[0] == 'a' && source.blob(1,0)[0] == 'd', "evicted bytes crossed stages");
+    require(source.file_reads() == 0, "loan/refill/exchange touched file fallback");
+    require(cudaSetDevice(1) == cudaSuccess, "close second device"); second.close();
+    require(cudaSetDevice(0) == cudaSuccess, "close first device"); first.close();
+}
+
+void test_helper_affinity() {
+#if defined(__linux__)
+    cpu_set_t original;
+    require(sched_getaffinity(0, sizeof original, &original) == 0, "read allowed CPUs");
+    int host = 0;
+    while (host < CPU_SETSIZE && !CPU_ISSET(host, &original)) ++host;
+    require(strata::platform::capture_helper_affinity(host), "capture helper affinity");
+    cpu_set_t singleton; CPU_ZERO(&singleton); CPU_SET(host, &singleton);
+    require(sched_setaffinity(0, sizeof singleton, &singleton) == 0, "pin service fixture");
+    strata::platform::apply_helper_affinity();
+    cpu_set_t helpers; const int rc = sched_getaffinity(0, sizeof helpers, &helpers);
+    require(sched_setaffinity(0, sizeof original, &original) == 0, "restore fixture affinity");
+    require(rc == 0 && CPU_COUNT(&helpers) > 0, "helper mask is empty");
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+        require(!CPU_ISSET(cpu, &helpers) || CPU_ISSET(cpu, &original), "helper escaped original allowed set");
+    if (CPU_COUNT(&original) > 2) require(!CPU_ISSET(host, &helpers), "helper inherited service pin");
+#endif
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--dual-resident") {
+            int devices = 0;
+            if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 2) {
+                std::cout << "dual resident fixture: SKIP (needs two GPUs)\n";
+                return 77;
+            }
+            test_dual_resident_loans_and_exchanges();
+            std::cout << "dual resident fixture: PASS\n";
+            return 0;
+        }
         test_complement_plan();
         test_resident_lend_region();
         test_resident_exchange();
         test_cgroup_memory_budget();
+        test_helper_affinity();
         test_canonical_layout();
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();
