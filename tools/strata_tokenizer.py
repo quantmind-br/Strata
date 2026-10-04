@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import pathlib
 import sys
+from functools import lru_cache
 
 import regex
 
@@ -87,6 +88,9 @@ class Tokenizer:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
         self._re = regex.compile(QWEN35_PATTERN)
+        # Per-vocabulary immutable merge results; long prompt pieces keep the heap
+        # path without occupying the bounded cache with large, rarely reused keys.
+        self._cached_bpe = lru_cache(maxsize=16384)(lambda word: tuple(self._bpe(word)))
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -206,7 +210,7 @@ class Tokenizer:
         out: list[int] = []
         for piece in self._re.findall(text):
             mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
-            for tok in self._bpe(mapped):
+            for tok in self._cached_bpe(mapped) if len(mapped) <= 256 else self._bpe(mapped):
                 i = self.ids.get(tok)
                 if i is None:
                     raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
