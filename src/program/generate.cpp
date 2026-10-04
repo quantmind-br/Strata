@@ -52,6 +52,7 @@
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/stage_weights.hpp"
+#include "strata/core/request_number.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/spec/draft_policy.hpp"
@@ -5098,6 +5099,8 @@ int main(int argc, char** argv) {
             float req_temperature = 0.0f, req_top_p = 1.0f;
             int req_top_k = 20;   // the sampler's own default; the sampled path REQUIRES top_k in 1..64
             unsigned long long req_seed = 0;
+            bool req_seed_present = false;
+            bool invalid_sampling = false;
             float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
             int req_penalty_last_n = 0;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
@@ -5115,6 +5118,10 @@ int main(int argc, char** argv) {
                     const size_t eq = tok.find('=');
                     if (eq == std::string::npos) { endp = const_cast<char*>(start); break; }
                     const std::string key = tok.substr(0, eq);
+                    if (!strata::core::request_number_valid(key, tok.substr(eq + 1))) {
+                        invalid_sampling = true;
+                        break;
+                    }
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "temperature") req_temperature = fv;
@@ -5125,11 +5132,18 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_repeat") req_penalty_repeat = fv;
                     else if (key == "penalty_freq") req_penalty_freq = fv;
                     else if (key == "penalty_present") req_penalty_present = fv;
-                    else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
+                    else if (key == "seed") {
+                        req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
+                        req_seed_present = true;
+                    }
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
+            }
+            if (invalid_sampling) {
+                std::printf("ERR invalid sampling parameter\n");
+                continue;
             }
             std::string emb_path;
             if (geni && endp != nullptr) {
@@ -5598,7 +5612,7 @@ int main(int argc, char** argv) {
             req_sp.temperature = req_temperature;
             req_sp.top_p = req_top_p;
             req_sp.top_k = req_top_k;
-            req_sp.seed = req_seed ? req_seed
+            req_sp.seed = req_seed_present ? req_seed
                                    : (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count();
             req_sp.min_p = std::clamp(req_min_p, 0.0f, 1.0f);
             req_sp.penalty_last_n = std::max(req_penalty_last_n, 0);
