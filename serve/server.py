@@ -2658,23 +2658,20 @@ class Server(ThreadingHTTPServer):
 
 
 def warn_tight_ram(arena_mib) -> None:
-    """The model's experts live in RAM (INFO arena_mib, engine 0.1.10+).  With less than ~6 GB left beside them for the
-    system, the engine and this server, Linux ends the engine mid-answer when memory runs out (issue #27) and Windows
-    pages to disk; say so at start instead of after a lost answer."""
-    if not isinstance(arena_mib, int) or arena_mib <= 0:
-        return
+    """Check live working-set headroom, including mmap/resident complements."""
     try:
-        import psutil
-        total = psutil.virtual_memory().total
-    except Exception:  # noqa: BLE001 - psutil is optional here
+        if os.name != "nt":
+            fields = {line.split(':', 1)[0]: int(line.split()[1]) for line in
+                      Path('/proc/meminfo').read_text().splitlines() if ':' in line}
+            available = fields['MemAvailable'] / 1024**2
+        else:
+            import psutil
+            available = psutil.virtual_memory().available / 2**30
+    except (OSError, ValueError, KeyError, ImportError):
         return
-    left = total / 2**30 - arena_mib / 1024
-    if left < 6:
-        print(f"[strata] WARNING: RAM is tight - the model's experts take {arena_mib / 1024:.1f} GB of this PC's "
-              f"{total / 2**30:.0f} GB, leaving {left:.1f} GB for everything else. "
-              + ("Linux may stop the engine in the middle of an answer. " if os.name != "nt" else
-                 "Windows will slow down (paging to disk). ")
-              + "Close other programs, or run START-HERE --setup and pick a smaller size (Q2_0 / IQ2_XS).", flush=True)
+    if available < 6:
+        print(f"[strata] WARNING: working-set headroom is {available:.1f} GiB; "
+              f"arena_mib={arena_mib} excludes mmap file cache and resident complements.", flush=True)
 
 
 DESKTOP_FREE_MIB = 2048          # #560 #516: below this, an AMD card that also drives a Linux desktop can run out

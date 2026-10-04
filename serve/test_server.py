@@ -23,6 +23,7 @@ from serve.frontend import ChatTemplate  # noqa: E402
 from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, Service, StrataEngine,  # noqa: E402
                           engine_args, prompt_tokens_seen, request_timings, serve, start_failure_hint)
 from types import SimpleNamespace  # noqa: E402
+from serve.server import warn_tight_ram  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
@@ -1968,6 +1969,16 @@ class StatusHandover(unittest.TestCase):
         self.assertEqual(svc.totals["decode_ms"], 0)
 
 
+class RamHeadroom(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux MemAvailable accounting")
+    def test_warning_uses_live_available_memory_not_arena_size(self):
+        for available_kib, warns in [(5 * 1024**2, True), (7 * 1024**2, False)]:
+            with self.subTest(available_kib=available_kib):
+                meminfo = f"MemTotal: {128 * 1024**2} kB\nMemAvailable: {available_kib} kB\n"
+                output = io.StringIO()
+                with mock.patch.object(Path, "read_text", return_value=meminfo), contextlib.redirect_stdout(output):
+                    warn_tight_ram(0)
+                self.assertEqual("WARNING" in output.getvalue(), warns)
 
 
 FAKE_STRATA = '''import pathlib, sys, time
