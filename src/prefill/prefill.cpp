@@ -1,5 +1,6 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/platform/helper_affinity.hpp"
+#include "strata/platform/thermal_gate.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
@@ -31,6 +32,9 @@
 #include "strata/prefill/kernels.hpp"
 
 #include <cuda_runtime.h>
+#if defined(__linux__) && !defined(STRATA_USE_HIP)
+#include <dlfcn.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -178,6 +182,49 @@ inline bool gr_unfused() {
 }
 
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+
+// Read the CUDA device's core temperature through NVML; unknown temperatures do not pause work.
+int gpu_temperature_c(int device) {
+#if defined(__linux__) && !defined(STRATA_USE_HIP)
+    struct Nvml {
+        int (*by_bus)(const char*, void**) = nullptr;
+        int (*temperature)(void*, int, unsigned*) = nullptr;
+        bool ok = false;
+    };
+    static const Nvml nvml = [] {
+        Nvml n;
+        void* lib = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
+        if (lib == nullptr) return n;
+        auto init = reinterpret_cast<int (*)()>(dlsym(lib, "nvmlInit_v2"));
+        n.by_bus = reinterpret_cast<int (*)(const char*, void**)>(dlsym(lib, "nvmlDeviceGetHandleByPciBusId_v2"));
+        n.temperature = reinterpret_cast<int (*)(void*, int, unsigned*)>(dlsym(lib, "nvmlDeviceGetTemperature"));
+        n.ok = init != nullptr && n.by_bus != nullptr && n.temperature != nullptr && init() == 0;
+        return n;
+    }();
+    char bus[32] = {};
+    void* handle = nullptr;
+    unsigned t = 0;
+    if (!nvml.ok || cudaDeviceGetPCIBusId(bus, sizeof bus, device) != cudaSuccess ||
+        nvml.by_bus(bus, &handle) != 0 || nvml.temperature(handle, 0 /* NVML_TEMPERATURE_GPU */, &t) != 0)
+        return -1;
+    return (int) t;
+#else
+    (void) device;
+    return -1;
+#endif
+}
+
+void prompt_thermal_gate(int device, const std::function<bool()>& should_stop) {
+    const auto& gate = strata::platform::thermal_gate();
+    if (gate.pause_c <= 0) return;
+    const auto t0 = Clock::now();
+    const auto w = strata::platform::thermal_wait(gate, [&] { return gpu_temperature_c(device); },
+        [&] { return should_stop && should_stop(); },
+        [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); });
+    if (w.steps > 0)
+        std::fprintf(stderr, "strata prefill: thermal gate CUDA%d %d C -> %d C, waited %.0f ms%s\n", device, w.peak_c,
+                     w.last_c, ms_since(t0), w.capped ? " (cap reached)" : w.stopped ? " (cancelled)" : "");
+}
 
 // Either cudaMalloc (owned, freed with the object) or a bump allocation from a borrowed region; with no base and
 // no region it only counts, which is how `bytes_needed` sizes the region.
@@ -1361,6 +1408,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     int ple_buf = 0;
 
     for (int64_t c0 = 0; c0 < n; c0 += m.T) {
+        prompt_thermal_gate(m.device, should_stop);
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
         const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
