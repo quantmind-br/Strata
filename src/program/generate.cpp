@@ -51,6 +51,7 @@
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
+#include "strata/core/stage_weights.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/spec/draft_policy.hpp"
@@ -329,6 +330,7 @@ struct Options {
     bool gpu_stages = false;
     bool stats = false;
     bool shared_late = false;          ///< plan v0.3 P3 A/B: shared expert inside post[l] (old order)
+    bool stage_dense = false;          ///< opt-in stage-filtered dense arenas; explicit split required
     bool keep_canonical = false;       ///< plan v0.3 P1 A/B: load canonical copies of natively served tensors
     bool no_token_graph = false;       ///< plan v0.3 P3 A/B: two graphs per layer instead of one per token
     bool no_fused_gr = false;          ///< plan v0.3 P3 A/B: the six-kernel native gr_read + separate gr_write
@@ -508,6 +510,7 @@ void usage() {
                  "  --dump-routing PATH  write the routed expert ids and weights per layer per position (P0.S8)\n"
                  "  --no-capture         run the layers directly instead of replaying graphs\n"
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
+                 "  --stage-dense        Experimental: filter dense tensors by explicit --layer-split\n"
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
                  "  --vision             --serve takes images too (GENI requests; embeddings from strata-vision)\n"
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
@@ -1329,6 +1332,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--stats") o.stats = true;
         else if (a == "--shared-late") o.shared_late = true;
+        else if (a == "--stage-dense") o.stage_dense = true;
         else if (a == "--keep-canonical") o.keep_canonical = true;
         else if (a == "--no-token-graph") o.no_token_graph = true;
         else if (a == "--no-fused-gr") o.no_fused_gr = true;
@@ -1984,6 +1988,18 @@ int main(int argc, char** argv) {
         }
         if (native_pack) skip.insert("token_embd.weight");
     }
+    if (o.stage_dense && (!multi_gpu || split_auto)) {
+        std::fprintf(stderr, "strata: --stage-dense requires an explicit multi-GPU layer split\n");
+        return 2;
+    }
+    const auto common_skip = skip;
+    auto stage_skip = [&](int64_t begin, int64_t end) {
+        auto result = common_skip; std::ifstream index(o.pack + "/index.txt");
+        std::string line; while (std::getline(index, line)) { std::istringstream row(line); std::string name;
+            if (row >> name && !strata::core::stage_weight_needed(name, begin, end)) result.insert(name); }
+        return result;
+    };
+    if (o.stage_dense) skip = stage_skip(0, split_at[0]);
     uint64_t pool_bytes = 0;
     if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -2015,7 +2031,7 @@ int main(int argc, char** argv) {
 
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
-        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
+        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key, 0, o.stage_dense ? split_at[0] : -1)) {
             std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
             return 1;
         }
@@ -2303,9 +2319,14 @@ int main(int argc, char** argv) {
             return 1;
         }
         const strata::core::OnDevice on(st.dev);
+        const int64_t dense_begin = o.stage_dense ? split_at[i] : 0;
+        const int64_t dense_end = o.stage_dense ? (i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers) : -1;
+        const auto local_skip = o.stage_dense ? stage_skip(dense_begin, dense_end) : common_skip;
+        uint64_t stage_pool_bytes = 0;
+        if (!strata::core::WeightTable::pool_bytes(o.pack, stage_pool_bytes, err, &local_skip)) return 1;
         void* arena_s = nullptr;
-        if (cudaMalloc(&arena_s, pool_bytes) != cudaSuccess ||
-            !st.wt.load(o.pack, arena_s, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
+        if (cudaMalloc(&arena_s, stage_pool_bytes) != cudaSuccess ||
+            !st.wt.load(o.pack, arena_s, stage_pool_bytes, err, &local_skip)) {
             cudaGetLastError();
             size_t free_b = 0, total_b = 0;   // #486: what that card had free
             cudaMemGetInfo(&free_b, &total_b);
@@ -2316,7 +2337,7 @@ int main(int argc, char** argv) {
                          (unsigned long long) (total_b >> 20));
             return 1;
         }
-        if (!o.native_dense_gguf.empty() && !st.dense.load(o.native_dense_gguf, st.wt, err, o.native_ple_key)) {
+        if (!o.native_dense_gguf.empty() && !st.dense.load(o.native_dense_gguf, st.wt, err, o.native_ple_key, dense_begin, dense_end)) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d native dense projections: %s\n", st.dev,
                          err.c_str());
             return 1;
@@ -4982,6 +5003,13 @@ int main(int argc, char** argv) {
                     slots_all += remote_experts[(size_t) r].resident();
                     mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
                 }
+            int pcie_layers = 0;
+            for (int64_t layer = 0; layer < g.n_layers; ++layer)
+                if (srcp->pcie_layer(layer)) ++pcie_layers;
+            std::printf("INFO pcie_eligible_layers=%d pcie_effective_frac=%.4f resident_expert_mib=%llu prefill_chunk=%lld stage_dense=%d\n",
+                        pcie_layers, pcie_layers ? o.pcie_frac : 0.0,
+                        (unsigned long long) (src.resident_bytes() >> 20), (long long) o.prefill_chunk,
+                        (int) o.stage_dense);
             std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
