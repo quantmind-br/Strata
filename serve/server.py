@@ -52,7 +52,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            images_of, openai_to_messages)
+                            _object_list, images_of, openai_to_messages)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
@@ -2348,6 +2348,7 @@ def make_handler(svc: Service):
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
                 if path in ("/v1/chat/completions", "/v1/messages"):
+                    req["messages"] = _object_list(req.get("messages"), "messages")
                     validate_request(req, "openai" if path.endswith("completions") else "anthropic")
                 if path in ("/v1/load", "/v1/unload"):
                     if not self._own_page("the model can be loaded or unloaded"):
