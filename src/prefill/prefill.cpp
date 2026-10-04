@@ -220,7 +220,11 @@ void prompt_thermal_gate(int device, const std::function<bool()>& should_stop) {
     const auto t0 = Clock::now();
     const auto w = strata::platform::thermal_wait(gate, [&] { return gpu_temperature_c(device); },
         [&] { return should_stop && should_stop(); },
-        [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); });
+        [](int ms) {
+            core::progress_at("waiting for prompt GPU cooling");
+            core::progress_beat();
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        });
     if (w.steps > 0)
         std::fprintf(stderr, "strata prefill: thermal gate CUDA%d %d C -> %d C, waited %.0f ms%s\n", device, w.peak_c,
                      w.last_c, ms_since(t0), w.capped ? " (cap reached)" : w.stopped ? " (cancelled)" : "");
