@@ -578,6 +578,9 @@ def transactional_pack(a, destination):
             raise ValueError(f"{destination}: source/options/converter identity mismatch; choose a new --out")
         if previous.get("artifacts") != tree_identity(destination):
             raise ValueError(f"{destination}: artifact integrity mismatch; existing pack preserved")
+        for path, before in stamps.items():
+            if source_stamp(path) != before:
+                raise ValueError(f"source changed during verification: {path}")
         print("verified identical pack; no files rewritten")
         return 0
     with tempfile.TemporaryDirectory(prefix=".stage-" + destination.name + "-", dir=destination.parent) as tmp:

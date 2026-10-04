@@ -2916,6 +2916,28 @@ def resolve_rope(ctx: int, scaling, scale, trained: int = 262144):
     return scaling or "yarn", scale if scale is not None else derived_factor(ctx, trained)
 
 
+def prepare_native_pack(pack, shard, pack_args, low_ram, env):
+    """Prepare final native-pack options once, preserving older immutable packs."""
+    complete = (pack / "native_experts.txt").exists() and (pack / "tokenizer" / "vocab.json").exists()
+    if complete and (not low_ram or (pack / "experts.bin").exists()):
+        return pack
+    # A text-only or legacy destination cannot be upgraded in place. Choose a
+    # separate pack and propagate it to the generated engine configuration.
+    if pack.exists():
+        candidate = pack.with_name(pack.name + ("-experts" if low_ram else "-native"))
+        suffix = 1
+        while candidate.exists():
+            ready = (candidate / "native_experts.txt").exists() and (candidate / "tokenizer" / "vocab.json").exists()
+            if ready and (not low_ram or (candidate / "experts.bin").exists()):
+                return candidate
+            candidate = pack.with_name(pack.name + ("-experts" if low_ram else "-native") + f"-{suffix}")
+            suffix += 1
+        pack = candidate
+    run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shard), "--out", str(pack),
+         *pack_args, *(["--experts-bin"] if low_ram else [])], env=env)
+    return pack
+
+
 # ------------------------------------------------------------------------------------------------ main
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -3508,15 +3530,10 @@ def main() -> int:
         if not (pack / "tokenizer" / "vocab.json").exists():
             run([sys.executable, str(ROOT / "tools" / "strata_tokenizer.py"), "--gguf", str(shards[0]),
                  "--out", str(pack)], env=env)   # writes <pack>/tokenizer/
-    elif not (pack / "native_experts.txt").exists() or not (pack / "tokenizer" / "vocab.json").exists():
-        # every tensor as the GGUF stores it; the experts are read from the GGUF at start (seconds to build)
-        # (UD-Q4_K_XL: --compat-bf16 - its Q8_0 hyper-connection projections become BF16, the form the engine reads)
-        run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
-             *fam.get("pack_args", [])], env=env)
-    if low_ram and not (pack / "experts.bin").exists():
-        say(f"  Writing the experts into one file for the low-RAM mode (one time, {MODELS[model]['arena_gb']:.0f} GB) ...")
-        run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
-             "--experts-bin"], env=env)
+    else:
+        if low_ram and not (pack / "experts.bin").exists():
+            say(f"  Writing the experts into one file for the low-RAM mode (one time, {MODELS[model]['arena_gb']:.0f} GB) ...")
+        pack = prepare_native_pack(pack, shards[0], fam.get("pack_args", []), low_ram, env)
     ok(f"model prepared: {pack}")
     mtp = (find_in(roots, "mtp/rt/experts.bin") or data / "mtp/rt/experts.bin").parent.parent
     rt = mtp / "rt"

@@ -50,6 +50,14 @@ def main():
         for folder in ('serve', 'tools'):
             shutil.copytree(ROOT / folder, stage / folder, ignore=shutil.ignore_patterns('__pycache__'))
         shutil.copy2(build / 'strata', stage / 'strata')
+        packaged = {str(p.relative_to(stage)): hashlib.sha256(p.read_bytes()).hexdigest()
+                    for folder in ('serve', 'tools') for p in (stage / folder).rglob('*') if p.is_file()}
+        expected = {path: digest for path, digest in sources.items()
+                    if path.startswith(('serve/', 'tools/'))}
+        if packaged != expected:
+            raise SystemExit('Packaged sources changed during copy; candidate not published. Rerun after edits finish.')
+        if source_identity() != sources:
+            raise SystemExit('Source changed during packaging; candidate not published. Rerun after edits finish.')
         manifest = {'release': release_id, 'revision': command('git', 'rev-parse', 'HEAD'),
                     'dirty': command('git', 'status', '--porcelain'), 'sources': sources,
                     'tracked_diff': command('git', 'diff', 'HEAD', '--binary'),
@@ -60,6 +68,8 @@ def main():
                     'binary_sha256': hashlib.sha256((stage / 'strata').read_bytes()).hexdigest(),
                     'cmake_cache': (build / 'CMakeCache.txt').read_text()}
         (stage / 'BUILD.json').write_text(json.dumps(manifest, indent=2) + '\n')
+        if source_identity() != sources:
+            raise SystemExit('Source changed during packaging; candidate not published. Rerun after edits finish.')
         stage.rename(releases / release_id)
     print(json.dumps({'release': str(releases / release_id), 'build': str(build)}))
 

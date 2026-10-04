@@ -188,3 +188,71 @@ class PackTransaction(unittest.TestCase):
                 self.assertEqual(iq_pack.transactional_pack(args, dst), 0)
             self.assertEqual((dst / "dense.bin").read_bytes(), (base / "dense.bin").read_bytes())
             self.assertEqual((dst / "dense.bin").stat().st_ino, (base / "dense.bin").stat().st_ino)
+
+    def test_reuse_rejects_source_mutation_after_source_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / 'source'
+            src.write_bytes(b'AAAA')
+            dst = root / 'pack'
+            args = argparse.Namespace(gguf=str(src), base=None, out=str(dst),
+                                      compat_bf16=False, experts_bin=False, skip_experts=False)
+
+            def build(a):
+                Path(a.out).mkdir()
+                (Path(a.out) / 'dense.bin').write_bytes(b'AAAA')
+                return 0
+
+            with patch.object(iq_pack, 'Model', return_value=types.SimpleNamespace(paths=[src])), \
+                    patch.object(iq_pack, 'build_pack', side_effect=build):
+                self.assertEqual(iq_pack.transactional_pack(args, dst), 0)
+                before = {p.name: p.read_bytes() for p in dst.iterdir()}
+                real_identity = iq_pack.tree_identity
+
+                def mutate_after_hash(path):
+                    result = real_identity(path)
+                    if path == dst:
+                        src.write_bytes(b'BBBB')
+                    return result
+
+                with patch.object(iq_pack, 'tree_identity', side_effect=mutate_after_hash):
+                    with self.assertRaisesRegex(ValueError, 'source changed during verification'):
+                        iq_pack.transactional_pack(args, dst)
+                self.assertEqual(before, {p.name: p.read_bytes() for p in dst.iterdir()})
+
+    def test_setup_low_ram_publishes_final_options_once_and_preserves_old_pack(self):
+        import contextlib
+        import io
+        import sys
+        import setup
+        from test_iq_pack import split_model, expected_experts
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shards = split_model(root)
+            commands = []
+
+            def export(cmd, **kwargs):
+                tokenizer = Path(cmd[cmd.index('--out') + 1]) / 'tokenizer'
+                tokenizer.mkdir()
+                (tokenizer / 'vocab.json').write_text('{}')
+                (tokenizer / 'chat_template.jinja').write_text('fixture')
+
+            def convert(cmd, **kwargs):
+                commands.append(cmd)
+                with patch.object(sys, 'argv', ['iq_pack.py', *cmd[2:]]):
+                    self.assertEqual(iq_pack.main(), 0)
+
+            with patch.object(setup, 'run', side_effect=convert), \
+                    patch.object(iq_pack.subprocess, 'run', side_effect=export), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                fresh = setup.prepare_native_pack(root / 'fresh', shards[0], [], True, {})
+                self.assertEqual(len(commands), 1)
+                self.assertTrue(json.loads((fresh / 'PACK.json').read_text())['identity']['experts_bin'])
+                self.assertEqual((fresh / 'experts.bin').read_bytes(), expected_experts(iq_pack.Model(shards[0])))
+                old = setup.prepare_native_pack(root / 'text', shards[0], [], False, {})
+                before = {p.relative_to(old): p.read_bytes() for p in old.rglob('*') if p.is_file()}
+                upgraded = setup.prepare_native_pack(old, shards[0], [], True, {})
+                self.assertNotEqual(upgraded, old)
+                self.assertEqual((upgraded / 'experts.bin').read_bytes(), (fresh / 'experts.bin').read_bytes())
+                self.assertEqual(before, {p.relative_to(old): p.read_bytes() for p in old.rglob('*') if p.is_file()})

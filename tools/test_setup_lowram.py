@@ -80,5 +80,48 @@ class PagingQuestion(unittest.TestCase):
                 self.assertIn("[y]" if choice == "off" else "[n]", asked[0])
 
 
+class NativePackPublication(unittest.TestCase):
+    def test_final_low_ram_options_and_upgrade_destination(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pack = root / 'pack'
+            shard = root / 'model.gguf'
+            commands = []
+
+            def convert(cmd, **kwargs):
+                commands.append(cmd)
+                destination = Path(cmd[cmd.index('--out') + 1])
+                destination.mkdir()
+                (destination / 'native_experts.txt').write_text('prepared')
+                (destination / 'tokenizer').mkdir()
+                (destination / 'tokenizer' / 'vocab.json').write_text('{}')
+                if '--experts-bin' in cmd:
+                    (destination / 'experts.bin').write_bytes(b'experts')
+
+            with mock.patch.object(setup, 'run', side_effect=convert):
+                selected = setup.prepare_native_pack(pack, shard, ['--compat-bf16'], True, {})
+                self.assertEqual(selected, pack)
+                self.assertEqual(len(commands), 1)
+                self.assertIn('--experts-bin', commands[0])
+                self.assertIn('--compat-bf16', commands[0])
+                self.assertEqual(setup.prepare_native_pack(pack, shard, [], True, {}), pack)
+                self.assertEqual(len(commands), 1)
+                for name in ('text-only', 'legacy'):
+                    old = root / name
+                    old.mkdir()
+                    (old / 'native_experts.txt').write_text('old')
+                    (old / 'tokenizer').mkdir()
+                    (old / 'tokenizer' / 'vocab.json').write_text('{}')
+                    if name == 'text-only':
+                        (old / 'PACK.json').write_text('{}')
+                    before = {p.relative_to(old): p.read_bytes() for p in old.rglob('*') if p.is_file()}
+                    selected = setup.prepare_native_pack(old, shard, ['--compat-bf16'], True, {})
+                    self.assertNotEqual(selected, old)
+                    self.assertEqual(Path(commands[-1][commands[-1].index('--out') + 1]), selected)
+                    self.assertTrue((selected / 'experts.bin').exists())
+                    self.assertEqual(before, {p.relative_to(old): p.read_bytes() for p in old.rglob('*') if p.is_file()})
+
+
 if __name__ == "__main__":
     unittest.main()
