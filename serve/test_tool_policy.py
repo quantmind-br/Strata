@@ -159,6 +159,39 @@ class Http(unittest.TestCase):
         out = self.post('/v1/chat/completions', request(tools=[TOOL]))
         self.assertEqual(len(out['choices'][0]['message']['tool_calls']), 2)
 
+    def test_malformed_named_choices_return_param_errors_before_stream(self):
+        self.start(BODY)
+        for function in ('execute', ['execute'], 7):
+            for stream in (False, True):
+                with self.subTest(function=function, stream=stream):
+                    self.assert_refused('/v1/chat/completions', request(
+                        tools=[TOOL], stream=stream,
+                        tool_choice={'type': 'function', 'function': function}), 'tool_choice')
+        self.assertEqual(self.svc.totals['requests'], 0)
+
+    def test_recovered_call_keeps_arguments_and_validates_declared_type(self):
+        tool = {'type': 'function', 'function': {'name': 'count', 'parameters': {
+            'type': 'object', 'properties': {'value': {'type': 'integer'}}}}}
+        for value in ('42', 'oops'):
+            self.start('<parameter=value>\n' + value + '\n</parameter>\n</function>')
+            req = request(tools=[tool], tool_choice='required')
+            if value == 'oops':
+                self.assert_refused('/v1/chat/completions', req)
+                chunks = self.stream(req)
+                errors = [c['error']['message'] for c in chunks if 'error' in c]
+                self.assertEqual(errors, ['tool count: parameter value does not match declared type integer'])
+                self.assertFalse(any(c.get('choices', [{}])[0].get('finish_reason') == 'tool_calls' for c in chunks))
+            else:
+                out = self.post('/v1/chat/completions', req)
+                call = out['choices'][0]['message']['tool_calls'][0]
+                self.assertEqual(json.loads(call['function']['arguments']), {'value': 42})
+                self.assertEqual(out['choices'][0]['finish_reason'], 'tool_calls')
+                chunks = self.stream(req)
+                pieces = [c for ch in chunks for c in ch['choices'][0]['delta'].get('tool_calls', [])]
+                self.assertEqual(json.loads(''.join(c.get('function', {}).get('arguments', '') for c in pieces)),
+                                 {'value': 42})
+                self.assertEqual(chunks[-1]['choices'][0]['finish_reason'], 'tool_calls')
+
     def test_anthropic_forced_tool_and_single_call(self):
         self.start(BODY + '\n<tool_call>\n<function=execute>\n' + BODY)
         req = {'model': 'm', 'max_tokens': 200, 'messages': [{'role': 'user', 'content': 'list files'}],

@@ -1706,7 +1706,7 @@ class Service:
                     finish = "stop"
                     break
         yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
-                       "timings": timings}
+                       "timings": timings, "stop_sequence": stopper.matched}
 
 
 def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
@@ -2024,12 +2024,14 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         else:
             if open_kind is not None:
                 yield close()
-            stop = "tool_use" if used_tool and streamed <= finished and x["finish"] == "stop" else \
+            delimiter = x.get("stop_sequence")
+            stop = "stop_sequence" if delimiter is not None else \
+                "tool_use" if used_tool and streamed <= finished and x["finish"] == "stop" else \
                 {"stop": "end_turn", "length": "max_tokens", "cancel": "end_turn"}[x["finish"]]
             # the final counts, Anthropic's way: input_tokens leaves out what the conversation cache already held,
             # which is cache_read_input_tokens (message_start could only say the whole prompt)
             reused = min(x.get("reused") or 0, len(ids))
-            yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
+            yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": delimiter},
                                     "usage": {"input_tokens": len(ids) - reused, "cache_read_input_tokens": reused,
                                               "output_tokens": x["completion_tokens"]}}
             yield "message_stop", {"type": "message_stop"}
@@ -2061,6 +2063,7 @@ def anthropic_collect(events) -> dict:
                 blocks.pop()
         elif name == "message_delta":
             msg["stop_reason"] = e["delta"]["stop_reason"]
+            msg["stop_sequence"] = e["delta"].get("stop_sequence")
             msg["usage"].update(e["usage"])
     msg["content"] = blocks
     return msg
@@ -2867,9 +2870,10 @@ def clean_shared_defaults(d) -> dict:
                 raise ValueError("top_k: an integer 1..64")
             value = int(value)
         elif key in ("seed", "max_tokens"):
-            if not number or type(value) is not int or value < (0 if key == "seed" else 1) or (
-                    key == "seed" and value > 2**64 - 1):
-                raise ValueError(f"{key}: " + ("an integer 0..2**64-1" if key == "seed" else "a positive integer"))
+            high = 2**64 - 1 if key == "seed" else 2**31 - 1
+            low = 0 if key == "seed" else 1
+            if not number or type(value) is not int or not low <= value <= high:
+                raise ValueError(f"{key}: an integer {low}..{high}")
             value = int(value)
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
@@ -2894,8 +2898,8 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
         number = isinstance(value, (int, float)) and not isinstance(value, bool) and (
             not isinstance(value, float) or math.isfinite(value))
         if key == "temperature":
-            if not number or value < 0:
-                raise SystemExit(f"[strata] config sampling.temperature={value!r}: expected a number >= 0 (0 = greedy)")
+            if not number or not 0 <= value <= 2:
+                raise SystemExit(f"[strata] config sampling.temperature={value!r}: expected 0..2 (0 = greedy)")
             out[key] = float(value)
         elif key == "top_p":
             if not number or not 0 < value <= 1:
@@ -2910,20 +2914,20 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
                 raise SystemExit(f"[strata] config sampling.top_k={value!r}: the sampled path takes an integer 1..64")
             out[key] = int(value)
         elif key == "presence_penalty":
-            if not number or value < 0:
-                raise SystemExit(f"[strata] config sampling.presence_penalty={value!r}: expected a number >= 0")
+            if not number or not 0 <= value <= 2:
+                raise SystemExit(f"[strata] config sampling.presence_penalty={value!r}: expected 0..2")
             out[key] = float(value)
         elif key == "frequency_penalty":
-            if not number or value < 0:
-                raise SystemExit(f"[strata] config sampling.frequency_penalty={value!r}: expected a number >= 0")
+            if not number or not 0 <= value <= 2:
+                raise SystemExit(f"[strata] config sampling.frequency_penalty={value!r}: expected 0..2")
             out[key] = float(value)
         elif key == "repetition_penalty":
-            if not number or value <= 0:
-                raise SystemExit(f"[strata] config sampling.repetition_penalty={value!r}: expected a number > 0 (1 = off)")
+            if not number or not 0 < value <= 1e6:
+                raise SystemExit(f"[strata] config sampling.repetition_penalty={value!r}: expected 0 < value <= 1e6 (1 = off)")
             out[key] = float(value)
         elif key == "penalty_last_n":
-            if not number or type(value) is not int or value < 1:
-                raise SystemExit(f"[strata] config sampling.penalty_last_n={value!r}: expected a positive integer")
+            if not number or type(value) is not int or not 1 <= value <= 2**31 - 1:
+                raise SystemExit(f"[strata] config sampling.penalty_last_n={value!r}: expected an integer 1..2**31-1")
             out[key] = int(value)
         elif key == "seed":
             if not number or type(value) is not int or not 0 <= value <= 2**64 - 1:

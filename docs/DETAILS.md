@@ -459,6 +459,8 @@ print(r.choices[0].message.content)
   integer 0..2**64-1 (including a reproducible `0`). Invalid controls return HTTP 400 with the offending `param`.
   OpenAI `stop` and Anthropic `stop_sequences` accept a nonempty string or one to four nonempty strings; the stop
   text and everything after it are omitted, even when a delimiter spans generated tokens.
+  Anthropic custom stops report `stop_reason: "stop_sequence"` and the matched delimiter in `stop_sequence`;
+  a natural end of turn still reports `end_turn`.
 - **Tool policy.** OpenAI `tool_choice: "required"` or a named function, and Anthropic `any` or a named `tool`,
   force an offered tool call with thinking disabled. A forced call that names an unoffered tool or never completes
   is an error, not a plain-text answer. OpenAI `parallel_tool_calls: false` and Anthropic
@@ -466,6 +468,9 @@ print(r.choices[0].message.content)
   Forced choices and single-call limits cannot be combined with server-side MCP tools. Structured `response_format`
   remains supported by the structured-output path; constrained JSON with tools/MCP remains unsupported.
   Request timings include the effective sampling settings and engine information when engine timings are available.
+  Configuration/shared sampling defaults use the same supported request bounds and reject invalid defaults at
+  admission, before a response stream starts. Recovered complete tool calls (missing only `</tool_call>`) retain
+  upstream recovery and must satisfy declared parameter types, just like normally closed calls.
 
 - **Thinking levels: none, low, medium, high.** The model thinks before it answers (streamed as
   `reasoning_content`, Anthropic: `thinking` blocks). Choose how much per request - in the chat page (the "Thinking"

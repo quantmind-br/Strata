@@ -99,8 +99,10 @@ def tool_choice(req, api="openai"):
                 return {"any": "required"}.get(kind, kind)
             if kind == "tool" and isinstance(choice.get("name"), str):
                 return ("function", choice["name"])
-        elif kind == "function" and isinstance((choice.get("function") or {}).get("name"), str):
-            return ("function", choice["function"]["name"])
+        elif kind == "function":
+            function = choice.get("function")
+            if isinstance(function, dict) and isinstance(function.get("name"), str):
+                return ("function", function["name"])
     raise RequestError("tool_choice", "expected auto, none, required or a named function")
 
 
