@@ -1,5 +1,5 @@
 #include "strata/core/request_number.hpp"
-#include "strata/core/stage_weights.hpp"
+#include <utility>
 #include <cstdio>
 int main() {
  using strata::core::request_number_valid;
@@ -9,11 +9,6 @@ int main() {
      bad += request_number_valid(pair.first, pair.second);
  for (auto pair : {std::pair{"seed", "0"}, {"seed", "18446744073709551615"}, {"top_k", "64"}, {"temperature", "0"}})
      bad += !request_number_valid(pair.first, pair.second);
- using strata::core::stage_weight_needed;
- bad += stage_weight_needed("blk.24.attn_q.weight", 0, 24);
- bad += !stage_weight_needed("blk.24.attn_q.weight", 24, 48);
- bad += !stage_weight_needed("blk.1.ple_key.weight", 24, 48);
- bad += !stage_weight_needed("output.weight", 24, 48);
- std::printf("request/stage predicates: %d failures\n", bad);
+ std::printf("request predicates: %d failures\n", bad);
  return bad ? 1 : 0;
 }

@@ -5,12 +5,17 @@ which experts start resident (the adaptive tier then swaps in what a conversatio
 ranks fewer pairs than a card can hold caps the cache (issue #46: a 32 GB card stopped at 8,000 slots); this tool
 writes one that ranks all 24,576.
 
-Without traces, preserve the base profile's ranking, then fill missing pairs across layers.
-Training requires --rerank (trace frequency first, base fallback) or --no-base,
-plus --checkpoint and a separate --out. A complete base must never silently mask training traces.
+The order: the base profile's ranking (default: the shipped data/expert-profile.bin), then the pairs your routing
+traces used, most frequent first, then every pair still missing, interleaved across the layers.  The base is only
+*appended to*, never reordered - and the shipped profile already ranks all 24,576 pairs, so with it a trace is a
+no-op.  `--reorder` ranks the traces first and lets the base fill the rest, which is how a workload's trace decides
+the top; `--no-base` drops the base entirely.  Training with traces requires --reorder or --no-base (a complete base
+must never silently mask them), plus --checkpoint and an --out other than the shipped profile; the checkpoint
+identity and the traces' hashes are written beside it (`<out>.json`).
 
-    python tools/make_profile.py [TRACE ...] [--base data/expert-profile.bin | --no-base] [--out PATH]
-                                 [--n-expert 256] [--rerank] [--checkpoint ID]
+    python tools/make_profile.py [TRACE ...] [--base data/expert-profile.bin | --no-base] [--reorder] [--out PATH]
+                                 [--n-expert 256] [--checkpoint ID]
+                                 (--n-expert 256: a pruned model, GSQ-RCO Coder keeps 256 of 512)
 
 A routing trace comes from a managed engine with `--dump-routing FILE` (a prompt typical of your use; the
 routed experts of every layer and position are written).  Point the model config's `--expert-profile` at the result.
@@ -61,53 +66,66 @@ def write_profile(path, ranked, n_expert=N_EXPERT):
             f.write(struct.pack("<%di" % n_expert, *table[layer]))
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("traces", nargs="*", help="routing traces from --dump-routing")
-    ap.add_argument("--base", default=str(ROOT / "data" / "expert-profile.bin"), help="ranking to keep first")
-    ap.add_argument("--rerank", action="store_true", help="rank trace frequency first, using base for ties/fallback")
-    ap.add_argument("--checkpoint", help="checkpoint identity recorded beside a trained ranking")
-    ap.add_argument("--no-base", action="store_true", help="rank by the traces only")
-    ap.add_argument("--out", default=str(ROOT / "data" / "expert-profile.bin"))
-    ap.add_argument("--n-expert", type=int, default=N_EXPERT, help="experts per layer (default 512)")
-    a = ap.parse_args()
+def rank_profile(base_pairs, trace_freq, n_expert=N_EXPERT, no_base=False, reorder=False):
+    """The ranked (layer, expert) list and the counts it was built from (`base`, `trace`, `fill`).
 
-    if a.traces and (not a.checkpoint or Path(a.out).resolve() == (ROOT / "data" / "expert-profile.bin").resolve()):
-        ap.error("training traces require --checkpoint and a checkpoint-specific --out")
-    if a.traces and not (a.rerank or a.no_base):
-        ap.error("traces require --rerank or --no-base; preserving a complete base ignores traces")
-    ranked, seen = [], set()
+    Default: the base's order, then the traces' pairs most frequent first, then the fill.  With `reorder` (or
+    `no_base`) the traces' pairs come first, so a base that already ranks every pair no longer hides them; the base
+    (unless `no_base`) and then the fill follow.  A base is never reordered against itself - it only ever fills."""
+    ranked, seen, counts = [], set(), defaultdict(int)
 
-    def take(pairs):
+    def take(pairs, key):
         for p in pairs:
             p = (int(p[0]), int(p[1]))
             if p not in seen:
                 seen.add(p)
                 ranked.append(p)
+                counts[key] += 1
 
+    trace_pairs = [p for p, _ in sorted(trace_freq.items(), key=lambda kv: (-kv[1], kv[0]))]
+    if no_base or reorder:
+        take(trace_pairs, "trace")
+    if not no_base:
+        take(base_pairs, "base")
+    if not (no_base or reorder):
+        take(trace_pairs, "trace")
+    take(((layer, e) for e in range(n_expert) for layer in range(N_LAYER)), "fill")
+    return ranked, counts
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("traces", nargs="*", help="routing traces from --dump-routing")
+    ap.add_argument("--base", default=str(ROOT / "data" / "expert-profile.bin"), help="ranking to keep first")
+    ap.add_argument("--no-base", action="store_true", help="rank by the traces only")
+    ap.add_argument("--reorder", action="store_true",
+                    help="rank the traces' pairs before the base's (the base, then the fill, follow); needed with a "
+                         "base that already ranks every pair, where --base alone cannot change the order")
+    ap.add_argument("--out", default=str(ROOT / "data" / "expert-profile.bin"))
+    ap.add_argument("--n-expert", type=int, default=N_EXPERT, help="experts per layer (default 512)")
+    ap.add_argument("--checkpoint", help="checkpoint identity recorded beside a trained ranking")
+    a = ap.parse_args()
+
+    if a.traces and (not a.checkpoint or Path(a.out).resolve() == (ROOT / "data" / "expert-profile.bin").resolve()):
+        ap.error("training traces require --checkpoint and a checkpoint-specific --out")
+    if a.traces and not (a.reorder or a.no_base):
+        ap.error("traces require --reorder or --no-base; preserving a complete base ignores traces")
     ne = a.n_expert
-    base = read_profile(a.base, ne) if not a.no_base else []
-    if not a.rerank:
-        take(base)
-    n_base = len(ranked)
     freq = defaultdict(int)
     for t in a.traces:
         for p, c in read_trace(t, ne).items():
             freq[p] += c
-    take(p for p, _ in sorted(freq.items(), key=lambda kv: (-kv[1], kv[0])))
-    n_trace = len(ranked) - n_base
-    if a.rerank:
-        take(base)
-    take((layer, e) for e in range(ne) for layer in range(N_LAYER))   # the rest, across the layers
+    base_pairs = [] if a.no_base else read_profile(a.base, ne)
+    ranked, counts = rank_profile(base_pairs, freq, ne, no_base=a.no_base, reorder=a.reorder)
     write_profile(a.out, ranked, ne)
     if a.checkpoint:
         import json, hashlib
         Path(a.out + ".json").write_text(json.dumps({"checkpoint": a.checkpoint,
             "traces": {str(p): hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in a.traces},
-            "rerank": a.rerank, "pairs": len(ranked)}, indent=2) + "\n")
+            "reorder": a.reorder, "pairs": len(ranked)}, indent=2) + "\n")
     assert read_profile(a.out, ne) == ranked, "the profile did not survive the round trip"
-    print(f"wrote {a.out}: {len(ranked)} ranked pairs ({n_base} from the base, {n_trace} from the traces, "
-          f"{len(ranked) - n_base - n_trace} filled in)")
+    print(f"wrote {a.out}: {len(ranked)} ranked pairs ({counts['base']} from the base, {counts['trace']} from the "
+          f"traces, {counts['fill']} filled in)")
 
 
 if __name__ == "__main__":
