@@ -1,5 +1,6 @@
 """Request guarantees supported by the native server (validated before SSE)."""
 import math
+from serve.frontend import tool_choice_of
 
 
 class RequestError(ValueError):
@@ -34,22 +35,11 @@ def validate_sampling(req):
                 raise RequestError("strata_tune", "only pcie_frac and spec_min_p in 0..1 are supported")
 
 
-def stop_sequences(req):
-    stops = req.get("stop", req.get("stop_sequences"))
-    if stops is None:
-        return []
-    if isinstance(stops, str):
-        stops = [stops]
-    if not isinstance(stops, list) or not 1 <= len(stops) <= 4 or any(not isinstance(s, str) or not s for s in stops):
-        raise RequestError("stop", "expected a nonempty string or one to four nonempty strings")
-    return stops
-
 
 def validate_request(req, api="openai"):
     if not isinstance(req, dict):
         raise RequestError("request", "expected an object")
     validate_sampling(req)
-    stop_sequences(req)
     for key in ("stream", "parallel_tool_calls"):
         if key in req and not isinstance(req[key], bool):
             raise RequestError(key, "expected a boolean")
@@ -67,16 +57,22 @@ def validate_request(req, api="openai"):
         if fn.get("strict"):
             raise RequestError("tools", "strict schema decoding is unavailable")
         names.add(fn["name"])
-    choice = tool_choice(req, api)
-    if choice == "none" and (tools or mcp):
-        raise RequestError("tool_choice", "none is unsupported when tools are offered; omit the tools instead")
-    if choice not in (None, "none"):
+    kind, name = tool_choice_of(req.get("tool_choice"))
+    if kind == "unknown":
+        raise RequestError("tool_choice", "expected auto, none, required or a named function")
+    choice = req.get("tool_choice")
+    if api == "anthropic" and isinstance(choice, dict) and "disable_parallel_tool_use" in choice:
+        if not isinstance(choice["disable_parallel_tool_use"], bool):
+            raise RequestError("tool_choice", "disable_parallel_tool_use must be a boolean")
+    if kind in ("required", "named"):
         if not tools:
             raise RequestError("tool_choice", "forcing a tool call requires the request's own tools")
         if mcp:
             raise RequestError("tool_choice", "forcing a tool call is unsupported with MCP tools")
-        if isinstance(choice, tuple) and choice[1] not in names:
+        if kind == "named" and name not in names:
             raise RequestError("tool_choice", "names a tool the request does not offer")
+    if kind == "none" and mcp:
+        raise RequestError("tool_choice", "none is unsupported with MCP tools")
     if mcp and single_call(req, api):
         raise RequestError("parallel_tool_calls", "a single-call limit is unsupported with MCP tools")
     if req.get("logprobs") or req.get("top_logprobs") or req.get("logit_bias"):
@@ -85,73 +81,8 @@ def validate_request(req, api="openai"):
         raise RequestError("messages", "expected a nonempty array of messages")
 
 
-def tool_choice(req, api="openai"):
-    """The request's tool choice -> None (automatic), "none", "required" or ("function", name)."""
-    choice = req.get("tool_choice")
-    if choice in (None, "auto", "none", "required"):
-        return None if choice == "auto" else choice
-    if isinstance(choice, dict):
-        kind = choice.get("type")
-        if api == "anthropic":
-            if kind == "auto":
-                return None
-            if kind in ("any", "none"):
-                return {"any": "required"}.get(kind, kind)
-            if kind == "tool" and isinstance(choice.get("name"), str):
-                return ("function", choice["name"])
-        elif kind == "function":
-            function = choice.get("function")
-            if isinstance(function, dict) and isinstance(function.get("name"), str):
-                return ("function", function["name"])
-    raise RequestError("tool_choice", "expected auto, none, required or a named function")
-
-
 def single_call(req, api="openai"):
     """True when at most one tool call may be returned (OpenAI parallel_tool_calls, Anthropic disable_parallel_tool_use)."""
     choice = req.get("tool_choice")
     return req.get("parallel_tool_calls") is False or (
         api == "anthropic" and isinstance(choice, dict) and choice.get("disable_parallel_tool_use") is True)
-
-
-CALL_PREFIX = "<tool_call>\n<function="
-
-
-def tool_policy(req, api="openai"):
-    """-> (prefix, max_calls) for a validated request.  prefix: the template text a forced choice starts the answer
-    with (a call to the named function - the only one offered, for "required" - or else a call whose name the model
-    writes, which must then be an offered tool); max_calls: 1 under a single-call
-    limit, else None.  The server returns only complete calls, so the limit is exact; a forced call that does not
-    complete is an error, never plain text."""
-    choice = tool_choice(req, api)
-    names = [t.get("function", t).get("name") for t in req.get("tools") or []]
-    if choice == "required" and len(names) == 1:
-        choice = ("function", names[0])          # one offered tool: requiring a call is calling that tool
-    prefix = ""
-    if choice == "required":
-        prefix = CALL_PREFIX
-    elif isinstance(choice, tuple):
-        prefix = CALL_PREFIX + choice[1] + ">\n"
-    return prefix, (1 if single_call(req, api) else None)
-
-
-class StopFilter:
-    """Hold only a possible delimiter prefix; never emit part of a stop sequence."""
-    def __init__(self, stops):
-        self.stops, self.pending, self.matched = stops, "", None
-
-    def feed(self, text):
-        if self.matched is not None:
-            return ""
-        text = self.pending + text
-        matches = [(text.find(s), s) for s in self.stops if s in text]
-        if matches:
-            pos, self.matched = min(matches, key=lambda pair: pair[0])
-            self.pending = ""
-            return text[:pos]
-        hold = max((n for s in self.stops for n in range(1, min(len(s), len(text) + 1)) if text.endswith(s[:n])), default=0)
-        self.pending = text[-hold:] if hold else ""
-        return text[:-hold] if hold else text
-
-    def finish(self):
-        text, self.pending = self.pending, ""
-        return text

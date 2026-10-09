@@ -8,8 +8,8 @@ import unittest
 import urllib.request
 import urllib.error
 
-from serve.controls import StopFilter, validate_request, validate_sampling
-from serve.server import (ByteTokenizer, ChatTemplate, MockEngine, Service, StrataEngine, serve,
+from serve.controls import validate_request, validate_sampling
+from serve.server import (ByteTokenizer, ChatTemplate, MockEngine, Service, StopMatcher, StrataEngine, serve,
                           anthropic_collect, anthropic_events, clean_shared_defaults, sampling_defaults_from_config)
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,19 +19,19 @@ class Controls(unittest.TestCase):
     def test_stop_every_boundary_and_unicode(self):
         text = 'ação before<END>must not leak'
         for split in range(len(text)+1):
-            filt = StopFilter(['<END>', 'unused'])
-            actual = filt.feed(text[:split]) + filt.feed(text[split:]) + filt.finish()
+            filt = StopMatcher(['<END>', 'unused'])
+            actual = filt.push(text[:split]) + filt.push(text[split:]) + filt.flush()
             self.assertEqual(actual, 'ação before')
-        filt = StopFilter(['xyxyz'])
-        self.assertEqual(''.join(filt.feed(t) for t in 'axyxyxyzafter') + filt.finish(), 'axy')
-        filt = StopFilter(['xyz'])
-        self.assertEqual(filt.feed('abxy') + filt.finish(), 'abxy')
+        filt = StopMatcher(['xyxyz'])
+        self.assertEqual(''.join(filt.push(t) for t in 'axyxyxyzafter') + filt.flush(), 'axy')
+        filt = StopMatcher(['xyz'])
+        self.assertEqual(filt.push('abxy') + filt.flush(), 'abxy')
 
     def test_controls_are_explicit(self):
         base = {'messages': [{'role':'user','content':'hi'}]}
         for control in [{'tool_choice':'required'},
                         {'seed':True}, {'seed':-1}, {'seed':2**64}, {'top_k':0}, {'top_k':65},
-                        {'temperature':float('nan')}, {'temperature':'1'}, {'stop':['']},
+                        {'temperature':float('nan')}, {'temperature':'1'},
                         {'max_tokens':2.5}, {'n':2}, {'seed':10**1000}, {'temperature':10**1000},
                         {'strata_tune':{'pcie_frac':10**1000}}]:
             with self.subTest(control=control), self.assertRaises(ValueError):

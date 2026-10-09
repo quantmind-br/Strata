@@ -37,34 +37,6 @@ def write_gguf(path, tensors, split=None, arch=True):
 
 
 class CompatibilityTests(unittest.TestCase):
-    def test_quantized_ple_conversion_preserves_source_payload(self):
-        # Unlike v6, upstream serves only Q2_0/Q8_0 keys natively. IQ keys
-        # retain their GGUF payload but their pack projection must be BF16.
-        for kind, block_bytes in [(Q.IQ3_XXS, 98), (Q.IQ4_XS, 136)]:
-            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                source = root / "key.gguf"
-                raw = np.arange(2 * block_bytes, dtype=np.uint8).reshape(2, block_bytes)
-                raw[:, :2] = np.frombuffer(np.float16(0.01).tobytes(), dtype=np.uint8)
-                writer = GGUFWriter(source, "qwen4exp")
-                writer.add_tensor("blk.1.ple_key.weight", raw, raw_dtype=kind)
-                writer.write_header_to_file()
-                writer.write_kv_data_to_file()
-                writer.write_tensors_to_file()
-                writer.close()
-                original = source.read_bytes()
-                model = iq_pack.Model(source)
-                with contextlib.redirect_stdout(io.StringIO()):
-                    self.assertEqual(iq_pack.index_standalone(source, root, model, True), 0)
-                _, rows = iq_pack.read_index(root / "index.txt")
-                self.assertEqual(rows["blk.1.ple_key.weight"][2], "4")
-                self.assertEqual(rows["blk.1.ple_key.weight"][7:9], ["256", "2"])
-                self.assertEqual((root / "dense.bin").read_bytes(),
-                                 iq_pack.bf16_bytes(raw.reshape(-1), kind.name))
-                conversions = json.loads((root / "conversions.json").read_text())["tensors"]
-                self.assertEqual([t["name"] for t in conversions], ["blk.1.ple_key.weight"])
-                self.assertEqual(model.bytes("blk.1.ple_key.weight").tobytes(), raw.tobytes())
-                self.assertEqual(source.read_bytes(), original)
 
     def test_bf16_halfway_rounds_to_even(self):
         values = np.array([0x3F808000, 0x3F818000, 0xBF808000, 0xBF818000], dtype=np.uint32)
@@ -150,10 +122,38 @@ class CompatibilityTests(unittest.TestCase):
     def test_q2_ple_and_large_tensors_stay_native(self):
         self.assertFalse(iq_pack.needs_bf16("blk.1.ple_key.weight", "Q2_0"))
         self.assertFalse(iq_pack.needs_bf16("blk.1.ple_key.weight", "Q8_0"))
-        self.assertTrue(iq_pack.needs_bf16("blk.1.ple_key.weight", "IQ3_XXS"))
+        self.assertFalse(iq_pack.needs_bf16("blk.1.ple_key.weight", "IQ3_XXS"))
+        self.assertFalse(iq_pack.needs_bf16("blk.1.ple_key.weight", "IQ4_XS"))
+        self.assertTrue(iq_pack.needs_bf16("blk.1.ple_key.weight", "Q6_K"))
         for name in ["blk.0.ffn_gate_exps.weight", "token_embd.weight", "output.weight",
                      "per_layer_token_embd.weight", "blk.0.attn_qkv.weight"]:
             self.assertFalse(iq_pack.needs_bf16(name, "IQ3_XXS"))
+
+    def test_iq_ple_keys_are_indexed_without_conversion(self):
+        for kind, block_bytes in [(Q.IQ3_XXS, 98), (Q.IQ4_XS, 136)]:
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+                root = Path(tmp)
+                source = root / "model.gguf"
+                writer = GGUFWriter(source, "qwen4exp")
+                raw = np.arange(2 * block_bytes, dtype=np.uint8).reshape(2, block_bytes)
+                raw[:, :2] = np.frombuffer(np.float16(0.01).tobytes(), dtype=np.uint8)
+                writer.add_tensor("blk.1.ple_key.weight", raw, raw_dtype=kind)
+                writer.write_header_to_file()
+                writer.write_kv_data_to_file()
+                writer.write_tensors_to_file()
+                writer.close()
+                before = source.read_bytes()
+                model = iq_pack.Model(source)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(iq_pack.index_standalone(source, root, model, True), 0)
+                _, rows = iq_pack.read_index(root / "index.txt")
+                row = rows["blk.1.ple_key.weight"]
+                self.assertEqual(row[2], "0")
+                self.assertEqual(row[7:9], ["256", "2"])
+                self.assertEqual((root / "dense.bin").read_bytes(), b"")
+                self.assertEqual(json.loads((root / "conversions.json").read_text())["tensors"], [])
+                self.assertEqual(model.bytes("blk.1.ple_key.weight").tobytes(), raw.tobytes())
+                self.assertEqual(source.read_bytes(), before)
 
     def test_experts_bin_is_kept_only_with_this_ggufs_blobs(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:

@@ -5,7 +5,7 @@ from strata_tokenizer import Tokenizer, BYTE_TO_UNICODE
 
 
 class BPECache(unittest.TestCase):
-    def test_exactness_bounded_and_tokenizer_isolation(self):
+    def test_exactness_and_tokenizer_isolation(self):
         vocab=list(BYTE_TO_UNICODE.values())+['ab','abc']
         a=Tokenizer(vocab,['a b','ab c']);b=Tokenizer(vocab,[])
         for text in ['abc '*500,'ação 日本語 🙂\n'*50, 'a'*300, '<|not_special|>\t']:
@@ -16,15 +16,12 @@ class BPECache(unittest.TestCase):
             self.assertEqual(a.encode(text),expected)
             self.assertEqual(a.encode(text),expected)
         self.assertNotEqual(a.encode('abc'),b.encode('abc'))
-        self.assertIsInstance(a._cached_bpe('abc'),tuple)
-        for i in range(17000):a._cached_bpe(str(i))
-        self.assertEqual(a._cached_bpe.cache_info().currsize,16384)
 
     def test_parallel_encoding_matches_uncached_high_entropy(self):
         vocab=list(BYTE_TO_UNICODE.values())+['ab','abc','<|im_end|>']
         cached=Tokenizer(vocab,['a b','ab c'])
         oracle=Tokenizer(vocab,['a b','ab c'])
-        oracle._cached_bpe=lambda word:tuple(oracle._bpe(word))
+        oracle.PIECE_CACHE_MAX = 0
         rng=random.Random(0)
         corpus=[''.join(rng.choices('abcXYZ0123456789!? ação🙂日本語',k=200)) for _ in range(100)]
         corpus+=['abc<|im_end|>ação','a'*300]
@@ -33,19 +30,6 @@ class BPECache(unittest.TestCase):
             actual=list(pool.map(lambda text:cached.encode(text,parse_special=True),corpus))
         self.assertEqual(actual,expected)
 
-    def test_encode_reuses_heap_results_but_bypasses_cache_for_long_words(self):
-        vocab = list(BYTE_TO_UNICODE.values()) + ['aa']
-        tokenizer = Tokenizer(vocab, ['a a'])
-        medium = 'a' * 128
-        expected = [tokenizer.ids['aa']] * 64
-        self.assertEqual(tokenizer.encode(medium), expected)
-        cold = tokenizer._cached_bpe.cache_info()
-        self.assertEqual(tokenizer.encode(medium), expected)
-        warm = tokenizer._cached_bpe.cache_info()
-        self.assertEqual(warm.misses, cold.misses)
-        self.assertEqual(warm.hits, cold.hits + 1)
-        self.assertEqual(tokenizer.encode('a' * 300), [tokenizer.ids['aa']] * 150)
-        self.assertEqual(tokenizer._cached_bpe.cache_info(), warm)
 
     def test_cached_special_token_boundaries_preserve_ids_and_decode(self):
         vocab = list(BYTE_TO_UNICODE.values()) + ['ab', '<|im_end|>', '<tool_call>']

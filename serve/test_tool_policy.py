@@ -5,7 +5,9 @@ import unittest
 import urllib.error
 import urllib.request
 
-from serve.controls import CALL_PREFIX, tool_policy, validate_request
+from serve.controls import single_call, validate_request
+from serve.frontend import CALL_START, forced_call
+from serve.test_server import CallingEngine
 from serve.server import ByteTokenizer, ChatTemplate, MockEngine, Service, serve
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,6 +17,7 @@ OTHER = {'type': 'function', 'function': {'name': 'read', 'parameters': {'type':
 BODY = '<parameter=command>\nls -la\n</parameter>\n</function>\n</tool_call>'
 TWO_CALLS = ('<tool_call>\n<function=execute>\n' + BODY + '\n<tool_call>\n<function=execute>\n'
              '<parameter=command>\nrm -rf x\n</parameter>\n</function>\n</tool_call>\ntrailing text')
+CALL_PREFIX = CALL_START + '\n<function='
 
 
 def request(**extra):
@@ -26,7 +29,7 @@ class Policy(unittest.TestCase):
         ok = [request(tools=[TOOL], tool_choice='required'),
               request(tools=[TOOL], tool_choice={'type': 'function', 'function': {'name': 'execute'}}),
               request(tools=[TOOL], parallel_tool_calls=False),
-              request(tool_choice='none')]
+              request(tools=[TOOL], tool_choice='none')]
         for req in ok:
             with self.subTest(req=req):
                 validate_request(req)
@@ -38,28 +41,23 @@ class Policy(unittest.TestCase):
                 validate_request(req, 'anthropic')
         bad = [request(tool_choice='required'),
                request(tools=[TOOL], tool_choice={'type': 'function', 'function': {'name': 'missing'}}),
-               request(tools=[TOOL], tool_choice='none'),
                request(tools=[TOOL], tool_choice={'type': 'allowed_tools'}),
                request(tools=[TOOL], tool_choice='required', strata_mcp=True),
                request(tools=[TOOL], parallel_tool_calls=False, strata_mcp=True)]
         for req in bad:
             with self.subTest(req=req), self.assertRaises(ValueError):
                 validate_request(req)
-        with self.assertRaises(ValueError):
-            validate_request(request(tools=[TOOL['function']], tool_choice={'type': 'none'}), 'anthropic')
+        validate_request(request(tools=[TOOL['function']], tool_choice={'type': 'none'}), 'anthropic')
 
     def test_policy(self):
-        self.assertEqual(tool_policy(request(tools=[TOOL])), ('', None))
-        self.assertEqual(tool_policy(request(tools=[TOOL], tool_choice='required')), (CALL_PREFIX + 'execute>\n', None))
-        self.assertEqual(tool_policy(request(tools=[TOOL, OTHER], tool_choice='required')), (CALL_PREFIX, None))
-        self.assertEqual(tool_policy(request(tools=[TOOL['function']], tool_choice={'type': 'any'}), 'anthropic'),
-                         (CALL_PREFIX + 'execute>\n', None))
-        named = {'type': 'function', 'function': {'name': 'execute'}}
-        self.assertEqual(tool_policy(request(tools=[TOOL], tool_choice=named, parallel_tool_calls=False)),
-                         (CALL_PREFIX + 'execute>\n', 1))
-        self.assertEqual(tool_policy(request(tool_choice={'type': 'tool', 'name': 'execute',
-                                                          'disable_parallel_tool_use': True}), 'anthropic'),
-                         (CALL_PREFIX + 'execute>\n', 1))
+        tools = [TOOL['function'], OTHER['function']]
+        self.assertIsNone(forced_call('auto', tools))
+        self.assertEqual(forced_call('required', tools[:1]), CALL_PREFIX + 'execute>\n')
+        self.assertEqual(forced_call('required', tools), CALL_PREFIX)
+        self.assertEqual(forced_call({'type': 'any'}, tools[:1]), CALL_PREFIX + 'execute>\n')
+        self.assertTrue(single_call(request(parallel_tool_calls=False)))
+        self.assertTrue(single_call(request(tool_choice={'type': 'tool', 'name': 'execute',
+                                                         'disable_parallel_tool_use': True}), 'anthropic'))
 
 
 class Http(unittest.TestCase):
@@ -124,12 +122,16 @@ class Http(unittest.TestCase):
         self.assert_refused('/v1/chat/completions',
                             request(tools=[TOOL], tool_choice={'type': 'function', 'function': {'name': 'execute'}}))
 
-    def test_forced_choice_needs_thinking_off(self):
-        self.start(BODY)
-        req = request(tools=[TOOL], tool_choice='required')
-        del req['reasoning_effort']
-        self.assert_refused('/v1/chat/completions', req, 'tool_choice')
-        self.assertEqual(self.svc.totals['requests'], 0)
+    def test_forced_choice_after_thinking(self):
+        tok = self.start(BODY)
+        self.svc.engine = self.engine = CallingEngine(tok)
+        tool = {'type': 'function', 'function': {'name': 'search', 'parameters': {
+            'type': 'object', 'properties': {'q': {'type': 'string'}}}}}
+        out = self.post('/v1/chat/completions', {'messages': [{'role': 'user', 'content': '2+2?'}],
+                                               'tools': [tool], 'tool_choice': 'required', 'max_tokens': 400})
+        call = out['choices'][0]['message']['tool_calls'][0]['function']
+        self.assertEqual((call['name'], json.loads(call['arguments'])), ('search', {'q': '2+2'}))
+        self.assertEqual(len(self.engine.prompts), 2)
 
     def test_single_call_limit_returns_only_the_first_complete_call(self):
         self.start(TWO_CALLS)
@@ -158,6 +160,25 @@ class Http(unittest.TestCase):
         self.start(TWO_CALLS)
         out = self.post('/v1/chat/completions', request(tools=[TOOL]))
         self.assertEqual(len(out['choices'][0]['message']['tool_calls']), 2)
+
+    def test_double_encoded_tools_survive_admission(self):
+        self.start(BODY)
+        out = self.post('/v1/chat/completions', request(tools=json.dumps([TOOL]), tool_choice='required'))
+        self.assertEqual(out['choices'][0]['message']['tool_calls'][0]['function']['name'], 'execute')
+
+    def test_single_call_limit_applies_to_reasoning_rescue(self):
+        self.start(TWO_CALLS.split('\ntrailing text')[0])
+        out = self.post('/v1/chat/completions', {'messages': [{'role': 'user', 'content': 'list files'}],
+                                               'tools': [TOOL], 'parallel_tool_calls': False, 'max_tokens': 1000})
+        self.assertEqual(len(out['choices'][0]['message']['tool_calls']), 1)
+        self.assertEqual(out['choices'][0]['finish_reason'], 'tool_calls')
+
+    def test_forced_recovery_does_not_downgrade_bad_arguments(self):
+        tool = {'type': 'function', 'function': {'name': 'count', 'parameters': {
+            'type': 'object', 'properties': {'value': {'type': 'integer'}}}}}
+        self.start('<parameter=value>oops</parameter>\n</function>\n</tool_call>')
+        self.svc.tool_call_recovery = True
+        self.assert_refused('/v1/chat/completions', request(tools=[tool], tool_choice='required'))
 
     def test_malformed_named_choices_return_param_errors_before_stream(self):
         self.start(BODY)
@@ -202,8 +223,15 @@ class Http(unittest.TestCase):
         self.assertEqual(len(uses), 1)
         self.assertEqual(uses[0]['input'], {'command': 'ls -la'})
         self.assertEqual(out['stop_reason'], 'tool_use')
+        self.svc.engine = self.engine = CallingEngine(self.svc.tok)
+        req['tools'] = [{'name': 'search', 'input_schema': {'type': 'object',
+                         'properties': {'q': {'type': 'string'}}}}]
+        req['tool_choice'] = {'type': 'tool', 'name': 'search', 'disable_parallel_tool_use': True}
         req['thinking'] = {'type': 'enabled', 'budget_tokens': 4096}
-        self.assert_refused('/v1/messages', req, 'tool_choice')
+        req['max_tokens'] = 400
+        out = self.post('/v1/messages', req)
+        uses = [b for b in out['content'] if b['type'] == 'tool_use']
+        self.assertEqual([(b['name'], b['input']) for b in uses], [('search', {'q': '2+2'})])
 
 
 if __name__ == '__main__':
