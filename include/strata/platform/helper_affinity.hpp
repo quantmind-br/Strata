@@ -1,6 +1,14 @@
 #pragma once
-// Capture before the host loop pins itself. Helpers restore the caller's allowed
-// mask, never the inherited single-CPU mask. Worker pools keep their own policy.
+// Where the engine's helper threads (every thread it creates that is neither a pool worker nor the host) run.
+//   1. capture_helper_affinity() runs before the host loop pins itself: the helper mask is the process's allowed
+//      CPUs minus the planned host core and its SMT siblings.  A helper never keeps the inherited single-CPU mask.
+//   2. apply_helper_affinity() is the first thing a helper does: restore that mask, then let --aux-cpus
+//      (strata/platform/aux_cpus.hpp) move the thread to its spare CPUs while the feature is on.  With it off the
+//      second step does nothing.
+//   3. restore_helper_mask() alone is for helpers whose placement is decided elsewhere (an explicit CPU pin, a thread
+//      that --aux-cpus must leave alone).
+// Worker pools keep their own policy.
+#include "strata/platform/aux_cpus.hpp"
 #if !defined(_WIN32)
 #include <sched.h>
 #include <cstdio>
@@ -33,12 +41,16 @@ inline bool capture_helper_affinity(int host_cpu) {
     helper_cpus_ready = true;
     return true;
 }
-inline void apply_helper_affinity() {
+inline void restore_helper_mask() {
     if (helper_cpus_ready && sched_setaffinity(0, sizeof helper_cpus, &helper_cpus) != 0)
         std::fprintf(stderr, "strata: could not restore helper affinity\n");
 }
 #else
 inline bool capture_helper_affinity(int) { return true; }
-inline void apply_helper_affinity() {}
+inline void restore_helper_mask() {}
 #endif
+inline void apply_helper_affinity() {
+    restore_helper_mask();
+    aux_cpus::pin_current_thread();
+}
 }

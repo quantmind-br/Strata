@@ -154,12 +154,12 @@ def random_text(rng, n_pieces=40):
 
 def encode_with(tok, text, parse_special, heap_min):
     tok.HEAP_MIN = heap_min
-    tok.__dict__.pop('_piece_ids', None)
+    tok._piece_ids.clear()
     try:
         return tok.encode(text, parse_special=parse_special)
     finally:
         del tok.HEAP_MIN
-        tok.__dict__.pop('_piece_ids', None)
+        tok._piece_ids.clear()
 
 
 def synthetic_tokenizer(seed=268, n_merges=1500):

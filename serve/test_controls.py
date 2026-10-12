@@ -39,6 +39,14 @@ class Controls(unittest.TestCase):
         validate_request({**base, 'seed':0, 'temperature':0, 'top_k':64, 'stop':['done']})
         self.assertIn(' seed=0', StrataEngine.sampling_keys({'seed':0}))
 
+    def test_aux_cpu_tuning_preserves_sampling_validation(self):
+        for value in (0, 1, True, False):
+            validate_sampling({'strata_tune': {'aux_cpus': value, 'pcie_frac': 0.35}})
+            self.assertIn(f'aux_cpus={int(value)}', StrataEngine.sampling_keys({'strata_tune': {'aux_cpus': value}}))
+        for value in (2, -1, 0.5, '1', None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_sampling({'strata_tune': {'aux_cpus': value}})
+
     def test_http_validation_precedes_stream(self):
         tok=ByteTokenizer(); engine=MockEngine(tok,'hello')
         svc=Service(engine,tok,ChatTemplate(ROOT/'serve/chat_template.jinja'))
@@ -133,7 +141,8 @@ class Controls(unittest.TestCase):
 
         svc.fifo = HandoffLock()
         result = list(svc.run([1], False, None, 100, {}, cancel))
-        self.assertEqual(result, [('done', {'finish': 'cancel', 'completion_tokens': 0, 'timings': None})])
+        self.assertEqual(result, [('done', {'finish': 'cancel', 'completion_tokens': 0, 'reused': 0, 'timings': None,
+                                            'reasoning_tokens': 0, 'reasoning_recoveries': 0})])
         self.assertTrue(svc.fifo.released)
         self.assertEqual(svc.status['queued'], 0)
         self.assertEqual(svc.totals['requests'], 0)

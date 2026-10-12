@@ -31,6 +31,10 @@ def validate_sampling(req):
         if not isinstance(tune, dict):
             raise RequestError("strata_tune", "expected an object")
         for key, value in tune.items():
+            if key == "aux_cpus":
+                if isinstance(value, bool) or (type(value) is int and value in (0, 1)):
+                    continue
+                raise RequestError("strata_tune", "aux_cpus must be 0, 1, true or false")
             if key not in ("pcie_frac", "spec_min_p") or isinstance(value, bool) or not isinstance(value, (int, float)) or (isinstance(value, float) and not math.isfinite(value)) or not 0 <= value <= 1:
                 raise RequestError("strata_tune", "only pcie_frac and spec_min_p in 0..1 are supported")
 
@@ -75,8 +79,8 @@ def validate_request(req, api="openai"):
         raise RequestError("tool_choice", "none is unsupported with MCP tools")
     if mcp and single_call(req, api):
         raise RequestError("parallel_tool_calls", "a single-call limit is unsupported with MCP tools")
-    if req.get("logprobs") or req.get("top_logprobs") or req.get("logit_bias"):
-        raise RequestError("logprobs/logit_bias", "unsupported by this engine")
+    if req.get("logprobs") or req.get("top_logprobs"):
+        raise RequestError("logprobs", "unsupported by this engine")
     if not isinstance(req.get("messages"), list) or not req["messages"] or any(not isinstance(m, dict) for m in req["messages"]):
         raise RequestError("messages", "expected a nonempty array of messages")
 

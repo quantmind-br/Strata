@@ -7,7 +7,9 @@ int main() {
  for (auto pair : {std::pair{"seed", "-1"}, {"seed", "18446744073709551616"}, {"top_k", "0"},
                    {"top_k", "65"}, {"top_k", "1.2"}, {"temperature", "nan"}, {"top_p", "inf"}, {"min_p", "1x"}})
      bad += request_number_valid(pair.first, pair.second);
- for (auto pair : {std::pair{"seed", "0"}, {"seed", "18446744073709551615"}, {"top_k", "64"}, {"temperature", "0"}})
+ // keys with their own parsers (or ignored by the caller) are not judged as numbers
+ for (auto pair : {std::pair{"seed", "0"}, {"seed", "18446744073709551615"}, {"top_k", "64"}, {"temperature", "0"},
+                   {"ckpt", "0"}, {"pin", "128"}, {"aux_cpus", "1"}, {"logit_bias", "12:-100,7:2.5"}, {"unknown", "x"}})
      bad += !request_number_valid(pair.first, pair.second);
  std::printf("request predicates: %d failures\n", bad);
  return bad ? 1 : 0;
