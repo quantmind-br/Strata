@@ -40,7 +40,7 @@ class Controls(unittest.TestCase):
         self.assertIn(' seed=0', StrataEngine.sampling_keys({'seed':0}))
 
     def test_aux_cpu_tuning_preserves_sampling_validation(self):
-        for value in (0, 1, True, False):
+        for value in (0, 1, 0.0, 1.0, True, False):
             validate_sampling({'strata_tune': {'aux_cpus': value, 'pcie_frac': 0.35}})
             self.assertIn(f'aux_cpus={int(value)}', StrataEngine.sampling_keys({'strata_tune': {'aux_cpus': value}}))
         for value in (2, -1, 0.5, '1', None):

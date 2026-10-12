@@ -1527,7 +1527,8 @@ class SamplingKeys(unittest.TestCase):
                           (1.0, "aux_cpus=1"), (0.0, "aux_cpus=0")):
             self.assertIn(want, self.keys(strata_tune={"aux_cpus": val}), val)
         for bad in (2, -1, 0.5, "1", None, "auto"):
-            self.assertFalse([x for x in self.keys(strata_tune={"aux_cpus": bad}) if x.startswith("aux_cpus=")], bad)
+            with self.subTest(value=bad), self.assertRaises(ValueError):
+                self.keys(strata_tune={"aux_cpus": bad})
         self.assertFalse([x for x in self.keys(temperature=0) if x.startswith("aux_cpus=")])
 
     def test_checkpoint_key(self):

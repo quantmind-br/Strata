@@ -32,7 +32,7 @@ def validate_sampling(req):
             raise RequestError("strata_tune", "expected an object")
         for key, value in tune.items():
             if key == "aux_cpus":
-                if isinstance(value, bool) or (type(value) is int and value in (0, 1)):
+                if isinstance(value, bool) or (isinstance(value, (int, float)) and value in (0, 1)):
                     continue
                 raise RequestError("strata_tune", "aux_cpus must be 0, 1, true or false")
             if key not in ("pcie_frac", "spec_min_p") or isinstance(value, bool) or not isinstance(value, (int, float)) or (isinstance(value, float) and not math.isfinite(value)) or not 0 <= value <= 1:
