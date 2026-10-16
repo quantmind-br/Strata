@@ -95,6 +95,9 @@ struct Fixture {
             for (size_t j=0;j<data.size();++j) data[j]=(uint8_t)(salt+i*31+j*7+j/257);
             if (!data.empty()) cuda_check(cudaMemcpy(sources[i],data.data(),data.size(),cudaMemcpyDefault));
         }
+        // A pageable cudaMemcpy may return before its DMA lands, and the snapshot copies run on a non-blocking
+        // stream: honor their contract (the device is synchronized before the copy) as the engine does.
+        cuda_check(cudaDeviceSynchronize());
     }
     void fill_after(uint8_t salt, int64_t first_dirty) {
         for (size_t i=0;i<sources.size();++i) {
@@ -103,6 +106,7 @@ struct Fixture {
             if (sizes[i] > offset)
                 cuda_check(cudaMemset(static_cast<uint8_t*>(sources[i])+offset, salt, sizes[i]-offset));
         }
+        cuda_check(cudaDeviceSynchronize());   // cudaMemset is asynchronous: see fill()
     }
     ~Fixture() { for (void* p:device) cudaFree(p); for (void* p:host) cudaFreeHost(p); }
 };
